@@ -7,44 +7,88 @@ import BaseLayout from '../layouts/BaseLayout.astro';
     <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
       <h1 class="text-4xl font-bold text-slate-800 dark:text-white mb-8">About Me</h1>
 
-      <div class="prose prose-lg dark:prose-invert max-w-none prose-headings:text-navy dark:prose-headings:text-teal-light prose-a:text-teal">
-        <!-- TODO: Replace with your real bio -->
+      <div class="space-y-10">
         <p class="text-xl text-slate-600 dark:text-slate-300 leading-relaxed">
           I'm a QA Analyst and Test Engineer based in the UK, with a deep commitment to
           shipping software that works &mdash; for everyone.
         </p>
 
-        <h2>My Story</h2>
-        <p>
-          <!-- TODO: Add your personal journey into QA -->
-          [Your story here — how you got into QA, what drew you to testing, your career journey.
-          Make it personal and authentic. Interviewers want to know the person behind the CV.]
-        </p>
+        <!-- My Story -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">My Story</h2>
+          <div class="space-y-4 text-slate-600 dark:text-slate-300 leading-relaxed">
+            <p>
+              My journey into QA began in the 1990s working for Abbey National (now part of Santander Bank) when my team leader told me that I had the mindset of a tester. However, it wasn't until 2000 that I started testing full-time whilst working for cahoot Internet Bank at a time when ecommerce was just taking off. My role there was as a non-functional tester working on:
+            </p>
+            <ul class="list-disc list-inside space-y-1 pl-4">
+              <li>Performance</li>
+              <li>Disaster Recovery</li>
+              <li>Security</li>
+            </ul>
+            <p>
+              Whilst there, I was occasionally called upon to develop ad-hoc work-around solutions to problems faced. One such issue was that the company contracted to do the backend solution were not obliged to send the file of new customer details to the fulfilment provider. I provided a temporary fix to cleanse the data before passing it through Abbey National's own system.
+            </p>
+            <p>
+              My next role was working in a small team functional testing IBM's main ETL offering (DataStage). This was my first exposure to test automation using WinRunner, QTP and IBM's own test automation product, Rational Functional Tester. In this role I had to adapt to testing combinations of operating systems and databases as well as desktop applications. I also got some exposure to Internationalisation and Localisation testing.
+            </p>
+            <p>
+              Following IBM, I worked for White Clarke Group (now a part of Solifi), a car finance software company. Here I gained experience of API testing using SOAPUI and also test automation using Selenium WebDriver and Gherkin. One of the problems we faced was that the front office system would send a large XML message (~100k) to the backend with many contract dates, payment dates etc. included. I wrote Groovy script to parameterise all the dates in the file, enabling testers to easily create contracts with start dates that fitted the scenarios they were trying to test.
+            </p>
+            <p>
+              I was also able to get to the root cause of an issue with customer statements and letters occasionally showing the wrong sign which was obscured by multiple work-around 'fixes'. This issue had threatened the entire project.
+            </p>
+            <p>
+              I then moved to bet365, testing their regulatory reporting. Accuracy of this reporting was key given that regulators could stop the company operating in their jurisdiction if unsatisfied. This role required strong SQL skills and I also developed some C# skills developing code to scan through multiple directories, unzipping files and using regular expressions to find required XML/JSON. Prior to this we would have to do this manually which was very time consuming. It also came in useful when Compliance wanted to find examples of submissions that met their test scenarios.
+            </p>
+            <p>
+              As you can see, my testing career has been very varied and I've been called upon to provide many ad-hoc fixes in addition to my normal testing work.
+            </p>
+          </div>
+        </div>
 
-        <h2>My Approach to Quality</h2>
-        <p>
-          I believe quality isn't a phase &mdash; it's a mindset. My approach combines:
-        </p>
-        <ul>
-          <li><strong>Risk-based testing</strong> — Focus effort where it matters most</li>
-          <li><strong>Shift-left thinking</strong> — Catch issues early through collaboration with developers and designers</li>
-          <li><strong>Automation with purpose</strong> — Automate the repetitive to free up time for exploratory testing</li>
-          <li><strong>Accessibility as standard</strong> — Every user deserves a good experience</li>
-        </ul>
+        <!-- My Approach -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">My Approach to Quality</h2>
+          <p class="text-slate-600 dark:text-slate-300 leading-relaxed mb-4">
+            I believe quality isn't a phase &mdash; it's a mindset. My approach combines:
+          </p>
+          <ul class="space-y-3">
+            <li class="flex items-start gap-3 text-slate-600 dark:text-slate-300">
+              <span class="flex-shrink-0 w-2 h-2 mt-2 rounded-full bg-teal"></span>
+              <span><strong class="text-slate-800 dark:text-white">Risk-based testing</strong> — Focus effort where it matters most</span>
+            </li>
+            <li class="flex items-start gap-3 text-slate-600 dark:text-slate-300">
+              <span class="flex-shrink-0 w-2 h-2 mt-2 rounded-full bg-teal"></span>
+              <span><strong class="text-slate-800 dark:text-white">Shift-left thinking</strong> — Catch issues early through collaboration with developers and designers</span>
+            </li>
+            <li class="flex items-start gap-3 text-slate-600 dark:text-slate-300">
+              <span class="flex-shrink-0 w-2 h-2 mt-2 rounded-full bg-teal"></span>
+              <span><strong class="text-slate-800 dark:text-white">Automation with purpose</strong> — Automate the repetitive to free up time for exploratory testing</span>
+            </li>
+            <li class="flex items-start gap-3 text-slate-600 dark:text-slate-300">
+              <span class="flex-shrink-0 w-2 h-2 mt-2 rounded-full bg-teal"></span>
+              <span><strong class="text-slate-800 dark:text-white">Accessibility as standard</strong> — Every user deserves a good experience</span>
+            </li>
+          </ul>
+        </div>
 
-        <h2>Beyond Testing</h2>
-        <p>
-          <!-- TODO: Add personal interests, hobbies, what makes you human -->
-          [What do you do outside of work? Hobbies, interests, community involvement.
-          This makes you relatable and memorable.]
-        </p>
+        <!-- Beyond Testing -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Beyond Testing</h2>
+          <p class="text-slate-600 dark:text-slate-300 leading-relaxed">
+            When I'm not testing software, you'll find me exploring my interests in retro computing and history. I'm fascinated by the evolution of technology and how it has shaped the world we live in today.
+          </p>
+        </div>
 
-        <h2>Let's Connect</h2>
-        <p>
-          I'm always happy to talk about testing, quality, or career advice.
-          <a href="/contact">Get in touch</a> or find me on
-          <a href="https://linkedin.com/in/paulyardley" target="_blank" rel="noopener noreferrer">LinkedIn</a>.
-        </p>
+        <!-- Let's Connect -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Let's Connect</h2>
+          <p class="text-slate-600 dark:text-slate-300 leading-relaxed">
+            I'm always happy to talk about testing, quality, or career advice.
+            <a href="/contact" class="text-teal hover:underline">Get in touch</a> or find me on
+            <a href="https://www.linkedin.com/in/paul-yardley-16731717/" target="_blank" rel="noopener noreferrer" class="text-teal hover:underline">LinkedIn</a>.
+          </p>
+        </div>
       </div>
     </div>
   </section>
