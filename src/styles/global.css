@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy: #1e293b;
+  --color-navy-light: #334155;
+  --color-teal: #14b8a6;
+  --color-teal-dark: #0d9488;
+  --color-teal-light: #5eead4;
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+  --color-slate-800: #1e293b;
+  --color-slate-900: #0f172a;
+  --color-slate-950: #020617;
+
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Dark mode support */
+.dark {
+  color-scheme: dark;
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Focus styles for accessibility */
+*:focus-visible {
+  outline: 2px solid var(--color-teal);
+  outline-offset: 2px;
+}
+
+/* Skip to content link */
+.skip-link {
+  position: absolute;
+  top: -40px;
+  left: 0;
+  padding: 8px 16px;
+  z-index: 100;
+  background: var(--color-teal);
+  color: white;
+  transition: top 0.2s;
+}
+
+.skip-link:focus {
+  top: 0;
+}

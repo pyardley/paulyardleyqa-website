@@ -1,0 +1,88 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="Resume — Paul Yardley QA" description="Paul Yardley's professional resume and CV. QA Analyst & Test Engineer with expertise in test automation and quality strategy.">
+  <section class="py-16 sm:py-24">
+    <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-12">
+        <h1 class="text-4xl font-bold text-slate-800 dark:text-white">Resume</h1>
+        <a
+          href="/resume/paul-yardley-cv-2026.pdf"
+          download
+          class="inline-flex items-center px-5 py-2.5 rounded-lg bg-teal text-white font-semibold hover:bg-teal-dark transition-colors shadow-lg shadow-teal/25"
+        >
+          <svg class="mr-2 w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          Download PDF
+        </a>
+      </div>
+
+      <div class="space-y-12">
+        <!-- Summary -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Professional Summary</h2>
+          <p class="text-slate-600 dark:text-slate-300 leading-relaxed">
+            <!-- TODO: Add your professional summary -->
+            [Your professional summary — 2-3 sentences highlighting your experience, specialisms, and what you bring to a team.]
+          </p>
+        </div>
+
+        <!-- Experience -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Experience</h2>
+          <div class="space-y-8">
+            <!-- TODO: Replace with your real experience -->
+            <div class="relative pl-8 border-l-2 border-teal/30">
+              <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal"></div>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Job Title]</h3>
+              <p class="text-teal font-medium">[Company Name]</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">[Start Date] — [End Date] | [Location]</p>
+              <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
+                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>[Key achievement or responsibility with quantified results]</li>
+              </ul>
+            </div>
+
+            <div class="relative pl-8 border-l-2 border-teal/30">
+              <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/60"></div>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Previous Job Title]</h3>
+              <p class="text-teal font-medium">[Company Name]</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">[Start Date] — [End Date] | [Location]</p>
+              <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
+                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>[Key achievement or responsibility with quantified results]</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Education -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Education</h2>
+          <div class="relative pl-8 border-l-2 border-teal/30">
+            <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/40"></div>
+            <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Degree / Qualification]</h3>
+            <p class="text-teal font-medium">[Institution]</p>
+            <p class="text-sm text-slate-500 dark:text-slate-400">[Year]</p>
+          </div>
+        </div>
+
+        <!-- Certifications -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Certifications</h2>
+          <ul class="space-y-2">
+            <!-- TODO: Add your certifications -->
+            <li class="flex items-center gap-3 text-slate-600 dark:text-slate-300">
+              <span class="w-2 h-2 rounded-full bg-teal flex-shrink-0"></span>
+              [Certification Name] — [Issuing Body] ([Year])
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

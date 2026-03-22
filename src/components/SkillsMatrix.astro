@@ -1,0 +1,73 @@
+---
+interface Skill {
+  name: string;
+  category: string;
+  level: number; // 1-5
+}
+
+const skills: Skill[] = [
+  // Test Automation
+  { name: 'Playwright', category: 'Test Automation', level: 5 },
+  { name: 'Cypress', category: 'Test Automation', level: 4 },
+  { name: 'Selenium', category: 'Test Automation', level: 4 },
+  { name: 'Postman / Newman', category: 'Test Automation', level: 5 },
+  { name: 'k6 / Performance', category: 'Test Automation', level: 3 },
+
+  // Languages & Frameworks
+  { name: 'TypeScript', category: 'Languages', level: 4 },
+  { name: 'JavaScript', category: 'Languages', level: 5 },
+  { name: 'Python', category: 'Languages', level: 3 },
+  { name: 'SQL', category: 'Languages', level: 4 },
+
+  // Tools & Platforms
+  { name: 'Git / GitHub', category: 'Tools & Platforms', level: 5 },
+  { name: 'GitHub Actions', category: 'Tools & Platforms', level: 4 },
+  { name: 'Jira / Azure DevOps', category: 'Tools & Platforms', level: 5 },
+  { name: 'Docker', category: 'Tools & Platforms', level: 3 },
+
+  // Testing Disciplines
+  { name: 'API Testing', category: 'Testing Disciplines', level: 5 },
+  { name: 'Accessibility (WCAG)', category: 'Testing Disciplines', level: 4 },
+  { name: 'Exploratory Testing', category: 'Testing Disciplines', level: 5 },
+  { name: 'Mobile Testing', category: 'Testing Disciplines', level: 4 },
+  { name: 'Security Testing', category: 'Testing Disciplines', level: 3 },
+];
+
+const categories = [...new Set(skills.map((s) => s.category))];
+const levelLabels = ['', 'Beginner', 'Familiar', 'Proficient', 'Advanced', 'Expert'];
+---
+
+<section id="skills" class="py-16 sm:py-24">
+  <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+    <h2 class="text-3xl font-bold text-slate-800 dark:text-white mb-2">Skills & Expertise</h2>
+    <p class="text-slate-500 dark:text-slate-400 mb-12 max-w-2xl">
+      A snapshot of my technical skills and proficiency levels. Always learning, always improving.
+    </p>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+      {categories.map((category) => (
+        <div class="bg-white dark:bg-slate-800 rounded-xl p-6 shadow-sm border border-slate-200 dark:border-slate-700">
+          <h3 class="text-lg font-semibold text-navy dark:text-teal-light mb-4">{category}</h3>
+          <div class="space-y-4">
+            {skills
+              .filter((s) => s.category === category)
+              .map((skill) => (
+                <div>
+                  <div class="flex justify-between items-center mb-1">
+                    <span class="text-sm font-medium text-slate-700 dark:text-slate-200">{skill.name}</span>
+                    <span class="text-xs text-slate-500 dark:text-slate-400">{levelLabels[skill.level]}</span>
+                  </div>
+                  <div class="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2" role="progressbar" aria-valuenow={skill.level * 20} aria-valuemin={0} aria-valuemax={100} aria-label={`${skill.name}: ${levelLabels[skill.level]}`}>
+                    <div
+                      class="bg-teal h-2 rounded-full transition-all duration-500"
+                      style={`width: ${skill.level * 20}%`}
+                    />
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
