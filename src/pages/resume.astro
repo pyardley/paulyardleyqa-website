@@ -2,7 +2,7 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 ---
 
-<BaseLayout title="Resume — Paul Yardley QA" description="Paul Yardley's professional resume and CV. QA Analyst & Test Engineer with expertise in test automation and quality strategy.">
+<BaseLayout title="Resume — Paul Yardley QA" description="Paul Yardley's professional resume and CV. Senior Test Analyst with 40+ years of IT experience in test automation, SQL, and quality assurance.">
   <section class="py-16 sm:py-24">
     <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-12">
@@ -20,41 +20,142 @@ import BaseLayout from '../layouts/BaseLayout.astro';
       </div>
 
       <div class="space-y-12">
-        <!-- Summary -->
+        <!-- Professional Summary -->
         <div>
-          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Professional Summary</h2>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Professional Profile</h2>
           <p class="text-slate-600 dark:text-slate-300 leading-relaxed">
-            <!-- TODO: Add your professional summary -->
-            [Your professional summary — 2-3 sentences highlighting your experience, specialisms, and what you bring to a team.]
+            A versatile tester with 40+ years of IT experience. Proven ability to adapt quickly to new roles and technologies to deliver high-quality results within challenging timescales.
           </p>
+        </div>
+
+        <!-- Technical Skills -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Technical Skills</h2>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div class="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-4">
+              <h3 class="text-sm font-semibold text-teal uppercase tracking-wide mb-2">Operating Systems</h3>
+              <p class="text-slate-600 dark:text-slate-300 text-sm">Windows and UNIX</p>
+            </div>
+            <div class="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-4">
+              <h3 class="text-sm font-semibold text-teal uppercase tracking-wide mb-2">Databases</h3>
+              <p class="text-slate-600 dark:text-slate-300 text-sm">SQL Server, Oracle, and Google BigQuery</p>
+            </div>
+            <div class="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-4">
+              <h3 class="text-sm font-semibold text-teal uppercase tracking-wide mb-2">Programming & Scripting</h3>
+              <p class="text-slate-600 dark:text-slate-300 text-sm">JAVA, C#, PL/SQL, T-SQL, bash scripting, and Groovy</p>
+            </div>
+            <div class="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-4">
+              <h3 class="text-sm font-semibold text-teal uppercase tracking-wide mb-2">Testing Tools</h3>
+              <p class="text-slate-600 dark:text-slate-300 text-sm">Selenium, Cucumber, JUnit, TestNG, SOAPUI, Postman, Jira/Zephyr, and RFT/QTP</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Core Achievements -->
+        <div>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Core Achievements & Specialisms</h2>
+          <div class="space-y-4">
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-teal/10 dark:bg-teal/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-800 dark:text-white">Automation & Scripting</h3>
+                <p class="text-slate-600 dark:text-slate-300 text-sm">Developed full Selenium/Java and Cucumber test suites from scratch, including custom reporting and error logging. Utilised SOAPUI Groovy and bash scripting to automate repetitive tasks and improve test accuracy.</p>
+              </div>
+            </div>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-teal/10 dark:bg-teal/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
+                </svg>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-800 dark:text-white">Data & SQL Expertise</h3>
+                <p class="text-slate-600 dark:text-slate-300 text-sm">Authored complex SQL queries and PL/SQL functions to extract test data, calculate clearance dates, and generate board-level reports.</p>
+              </div>
+            </div>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-teal/10 dark:bg-teal/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-800 dark:text-white">Modern Technology Integration</h3>
+                <p class="text-slate-600 dark:text-slate-300 text-sm">Extensively used AI to generate test data, draft test cases, summarise documentation, and create SQL/Jira tickets.</p>
+              </div>
+            </div>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-teal/10 dark:bg-teal/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                </svg>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-800 dark:text-white">Specialised Testing</h3>
+                <p class="text-slate-600 dark:text-slate-300 text-sm">Experienced in Security, Performance (Loadrunner), Globalisation, and Disaster Recovery testing.</p>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Experience -->
         <div>
-          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Experience</h2>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Professional Experience</h2>
           <div class="space-y-8">
-            <!-- TODO: Replace with your real experience -->
             <div class="relative pl-8 border-l-2 border-teal/30">
               <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal"></div>
-              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Job Title]</h3>
-              <p class="text-teal font-medium">[Company Name]</p>
-              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">[Start Date] — [End Date] | [Location]</p>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">Senior Test Analyst</h3>
+              <p class="text-teal font-medium">Bet365</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">2023 — Present</p>
               <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
-                <li>[Key achievement or responsibility with quantified results]</li>
-                <li>[Key achievement or responsibility with quantified results]</li>
-                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>Conducting Functional Verification Testing (FVT) for critical regulatory reports and submissions involving complex calculations</li>
+              </ul>
+            </div>
+
+            <div class="relative pl-8 border-l-2 border-teal/30">
+              <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/80"></div>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">Senior Test Analyst</h3>
+              <p class="text-teal font-medium">Solifi</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">2013 — 2023</p>
+              <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
+                <li>Focused on web client FVT and test automation using Selenium, Cucumber, and SOAPUI</li>
               </ul>
             </div>
 
             <div class="relative pl-8 border-l-2 border-teal/30">
               <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/60"></div>
-              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Previous Job Title]</h3>
-              <p class="text-teal font-medium">[Company Name]</p>
-              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">[Start Date] — [End Date] | [Location]</p>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">System Test Engineer</h3>
+              <p class="text-teal font-medium">IBM (Software Group)</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">2005 — 2013</p>
               <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
-                <li>[Key achievement or responsibility with quantified results]</li>
-                <li>[Key achievement or responsibility with quantified results]</li>
-                <li>[Key achievement or responsibility with quantified results]</li>
+                <li>Performed manual and automated functional testing across Windows, web, and command-line interfaces</li>
+                <li>Coordinated translation and globalisation testing</li>
+              </ul>
+            </div>
+
+            <div class="relative pl-8 border-l-2 border-teal/30">
+              <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/40"></div>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">Senior Test Analyst</h3>
+              <p class="text-teal font-medium">cahoot Internet Bank</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">2000 — 2005</p>
+              <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
+                <li>Managed disaster recovery solutions, security testing, and performance monitoring for web products</li>
+              </ul>
+            </div>
+
+            <div class="relative pl-8 border-l-2 border-teal/30">
+              <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/20"></div>
+              <h3 class="text-lg font-semibold text-slate-800 dark:text-white">Senior Analyst Programmer</h3>
+              <p class="text-teal font-medium">Santander (formerly Abbey National)</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">1986 — 2000</p>
+              <ul class="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-1 text-sm">
+                <li>Progressed from Graduate Trainee to Senior Analyst Programmer</li>
+                <li>Designed data models and mortgage rate change suites</li>
               </ul>
             </div>
           </div>
@@ -65,22 +166,16 @@ import BaseLayout from '../layouts/BaseLayout.astro';
           <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-6">Education</h2>
           <div class="relative pl-8 border-l-2 border-teal/30">
             <div class="absolute -left-2 top-0 w-4 h-4 rounded-full bg-teal/40"></div>
-            <h3 class="text-lg font-semibold text-slate-800 dark:text-white">[Degree / Qualification]</h3>
-            <p class="text-teal font-medium">[Institution]</p>
-            <p class="text-sm text-slate-500 dark:text-slate-400">[Year]</p>
+            <h3 class="text-lg font-semibold text-slate-800 dark:text-white">BSc, Management Sciences</h3>
+            <p class="text-teal font-medium">UMIST, Manchester</p>
+            <p class="text-sm text-slate-500 dark:text-slate-400">1983 — 1986</p>
           </div>
         </div>
 
-        <!-- Certifications -->
+        <!-- Interests -->
         <div>
-          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Certifications</h2>
-          <ul class="space-y-2">
-            <!-- TODO: Add your certifications -->
-            <li class="flex items-center gap-3 text-slate-600 dark:text-slate-300">
-              <span class="w-2 h-2 rounded-full bg-teal flex-shrink-0"></span>
-              [Certification Name] — [Issuing Body] ([Year])
-            </li>
-          </ul>
+          <h2 class="text-2xl font-bold text-navy dark:text-teal-light mb-4">Interests</h2>
+          <p class="text-slate-600 dark:text-slate-300">Retro computing and History</p>
         </div>
       </div>
     </div>
