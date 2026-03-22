@@ -7,30 +7,30 @@ interface Skill {
 
 const skills: Skill[] = [
   // Test Automation
-  { name: 'Playwright', category: 'Test Automation', level: 5 },
-  { name: 'Cypress', category: 'Test Automation', level: 4 },
-  { name: 'Selenium', category: 'Test Automation', level: 4 },
-  { name: 'Postman / Newman', category: 'Test Automation', level: 5 },
-  { name: 'k6 / Performance', category: 'Test Automation', level: 3 },
+  { name: 'Playwright', category: 'Test Automation', level: 3 },
+  { name: 'Cypress', category: 'Test Automation', level: 1 },
+  { name: 'Selenium', category: 'Test Automation', level: 2 },
+  { name: 'Postman / Newman', category: 'Test Automation', level: 3 },
+  { name: 'k6 / Performance', category: 'Test Automation', level: 2 },
 
   // Languages & Frameworks
-  { name: 'TypeScript', category: 'Languages', level: 4 },
-  { name: 'JavaScript', category: 'Languages', level: 5 },
-  { name: 'Python', category: 'Languages', level: 3 },
+  { name: 'TypeScript', category: 'Languages', level: 3 },
+  { name: 'JavaScript', category: 'Languages', level: 3 },
+  { name: 'Python', category: 'Languages', level: 1 },
   { name: 'SQL', category: 'Languages', level: 4 },
 
   // Tools & Platforms
-  { name: 'Git / GitHub', category: 'Tools & Platforms', level: 5 },
-  { name: 'GitHub Actions', category: 'Tools & Platforms', level: 4 },
-  { name: 'Jira / Azure DevOps', category: 'Tools & Platforms', level: 5 },
-  { name: 'Docker', category: 'Tools & Platforms', level: 3 },
+  { name: 'Git / GitHub', category: 'Tools & Platforms', level: 2 },
+  { name: 'GitHub Actions', category: 'Tools & Platforms', level: 1 },
+  { name: 'Jira / Azure DevOps', category: 'Tools & Platforms', level: 4 },
+  { name: 'Docker', category: 'Tools & Platforms', level: 2 },
 
   // Testing Disciplines
-  { name: 'API Testing', category: 'Testing Disciplines', level: 5 },
-  { name: 'Accessibility (WCAG)', category: 'Testing Disciplines', level: 4 },
-  { name: 'Exploratory Testing', category: 'Testing Disciplines', level: 5 },
-  { name: 'Mobile Testing', category: 'Testing Disciplines', level: 4 },
-  { name: 'Security Testing', category: 'Testing Disciplines', level: 3 },
+  { name: 'API Testing', category: 'Testing Disciplines', level: 4 },
+  { name: 'Accessibility (WCAG)', category: 'Testing Disciplines', level: 1 },
+  { name: 'Exploratory Testing', category: 'Testing Disciplines', level: 4 },
+  { name: 'Mobile Testing', category: 'Testing Disciplines', level: 1 },
+  { name: 'Security Testing', category: 'Testing Disciplines', level: 2 },
 ];
 
 const categories = [...new Set(skills.map((s) => s.category))];
