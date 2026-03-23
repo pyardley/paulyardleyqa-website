@@ -94,59 +94,73 @@ const currentPath = Astro.url.pathname;
   </nav>
 </header>
 
-<script>
-  function initHeader() {
-    const themeToggle = document.getElementById('theme-toggle');
-    const themeToggleMobile = document.getElementById('theme-toggle-mobile');
-    const mobileMenuBtn = document.getElementById('mobile-menu-btn');
-    const mobileMenu = document.getElementById('mobile-menu');
+<script is:inline>
+  (function () {
+    var themeToggle = document.getElementById('theme-toggle');
+    var themeToggleMobile = document.getElementById('theme-toggle-mobile');
+    var mobileMenuBtn = document.getElementById('mobile-menu-btn');
+    var mobileMenu = document.getElementById('mobile-menu');
 
-    // Dark mode toggle
     function toggleTheme() {
-      const html = document.documentElement;
-      html.classList.toggle('dark');
-      const isDark = html.classList.contains('dark');
-      localStorage.setItem('theme', isDark ? 'dark' : 'light');
+      var html = document.documentElement;
+      if (html.classList.contains('dark')) {
+        html.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
+      } else {
+        html.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+      }
     }
 
-    // Close mobile menu
     function closeMobileMenu() {
-      mobileMenu?.classList.add('hidden');
-      mobileMenuBtn?.setAttribute('aria-expanded', 'false');
+      if (mobileMenu) mobileMenu.classList.add('hidden');
+      if (mobileMenuBtn) mobileMenuBtn.setAttribute('aria-expanded', 'false');
     }
 
-    themeToggle?.addEventListener('click', toggleTheme);
+    if (themeToggle) {
+      themeToggle.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleTheme();
+      });
+    }
 
-    themeToggleMobile?.addEventListener('click', () => {
-      toggleTheme();
-      closeMobileMenu();
-    });
+    if (themeToggleMobile) {
+      themeToggleMobile.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleTheme();
+        closeMobileMenu();
+      });
+    }
 
-    // Mobile menu toggle
-    mobileMenuBtn?.addEventListener('click', () => {
-      const isOpen = mobileMenu?.classList.toggle('hidden') === false;
-      mobileMenuBtn.setAttribute('aria-expanded', String(isOpen));
-    });
+    if (mobileMenuBtn) {
+      mobileMenuBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var isOpen = mobileMenu.classList.toggle('hidden') === false;
+        mobileMenuBtn.setAttribute('aria-expanded', String(isOpen));
+      });
+    }
 
     // Close mobile menu when a nav link is clicked
-    mobileMenu?.querySelectorAll('a').forEach((link) => {
-      link.addEventListener('click', closeMobileMenu);
-    });
+    if (mobileMenu) {
+      var links = mobileMenu.querySelectorAll('a');
+      for (var i = 0; i < links.length; i++) {
+        links[i].addEventListener('click', closeMobileMenu);
+      }
+    }
 
     // Close mobile menu on outside click
-    document.addEventListener('click', (e) => {
+    document.addEventListener('click', function (e) {
       if (
         mobileMenu &&
         !mobileMenu.classList.contains('hidden') &&
-        !mobileMenu.contains(e.target as Node) &&
-        !mobileMenuBtn?.contains(e.target as Node)
+        !mobileMenu.contains(e.target) &&
+        mobileMenuBtn &&
+        !mobileMenuBtn.contains(e.target)
       ) {
         closeMobileMenu();
       }
     });
-  }
-
-  // Run on initial load and after Astro page navigations
-  initHeader();
-  document.addEventListener('astro:after-swap', initHeader);
+  })();
 </script>
