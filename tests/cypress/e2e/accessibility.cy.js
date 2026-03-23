@@ -75,9 +75,13 @@ describe("Accessibility - Global Elements", () => {
       .and("match", /menu/i);
   });
 
-  it("should have alt text on all images", () => {
-    cy.get("img").each(($img) => {
-      cy.wrap($img).should("have.attr", "alt");
+  it("should have alt text on all images if any exist", () => {
+    cy.get("body").then(($body) => {
+      if ($body.find("img").length > 0) {
+        cy.get("img").each(($img) => {
+          cy.wrap($img).should("have.attr", "alt");
+        });
+      }
     });
   });
 

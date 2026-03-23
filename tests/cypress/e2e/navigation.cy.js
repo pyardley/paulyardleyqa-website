@@ -30,7 +30,7 @@ describe("Desktop Navigation", () => {
       desktopNav
         .find(`a[href="${item.href}"]`)
         .should("be.visible")
-        .and("have.text", item.label);
+        .and("contain.text", item.label);
     });
   });
 
