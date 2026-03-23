@@ -30,4 +30,4 @@ jobs:
         uses: treosh/lighthouse-ci-action@v12
         with:
           uploadArtifacts: true
-          configPath: ./tests/lighthouse/lighthouse.config.js
+          configPath: ./tests/lighthouse/lighthouse.config.cjs
