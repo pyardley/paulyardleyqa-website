@@ -25,9 +25,8 @@ describe("Desktop Navigation", () => {
   });
 
   it("should display all navigation links in the desktop nav", () => {
-    const desktopNav = cy.get("nav .hidden.md\\:flex");
     navItems.forEach((item) => {
-      desktopNav
+      cy.get("nav .hidden.md\\:flex")
         .find(`a[href="${item.href}"]`)
         .should("be.visible")
         .and("contain.text", item.label);
