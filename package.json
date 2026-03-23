@@ -11,7 +11,9 @@
     "preview": "astro preview",
     "astro": "astro",
     "test:e2e": "npx playwright test",
-    "test:e2e:ui": "npx playwright test --ui"
+    "test:e2e:ui": "npx playwright test --ui",
+    "test:cypress": "npx cypress run --config-file cypress.config.cjs",
+    "test:cypress:open": "npx cypress open --config-file cypress.config.cjs"
   },
   "dependencies": {
     "@astrojs/mdx": "^5.0.2",
@@ -26,6 +28,7 @@
     "tailwindcss": "^4.2.2"
   },
   "devDependencies": {
-    "@playwright/test": "^1.58.2"
+    "@playwright/test": "^1.58.2",
+    "cypress": "^13.17.0"
   }
 }
