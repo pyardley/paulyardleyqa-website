@@ -26,3 +26,6 @@ pnpm-debug.log*
 # Playwright
 playwright-report/
 test-results/
+
+# k6
+tests/k6/results/

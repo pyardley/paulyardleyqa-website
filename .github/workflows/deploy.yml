@@ -54,3 +54,29 @@ jobs:
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      - name: Install k6
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz | tar xzf - --strip-components=1
+          sudo mv k6 /usr/local/bin/
+
+      - name: Wait for Netlify deployment to propagate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: sleep 15
+
+      - name: Run k6 performance tests
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          mkdir -p tests/k6/results
+          k6 run tests/k6/performance.js
+        env:
+          BASE_URL: https://paulyardleyqa.co.uk
+
+      - name: Upload k6 results
+        uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !cancelled()
+        with:
+          name: k6-performance-report
+          path: tests/k6/results/
+          retention-days: 30
