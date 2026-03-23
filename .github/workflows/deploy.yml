@@ -45,6 +45,22 @@ jobs:
           path: playwright-report/
           retention-days: 14
 
+      - name: Run Cypress tests against localhost
+        run: |
+          npx astro preview --port 4322 &
+          sleep 3
+          CYPRESS_BASE_URL=http://localhost:4322 npx cypress run --config-file cypress.config.cjs
+        env:
+          CI: true
+
+      - name: Upload Cypress screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cypress-screenshots
+          path: tests/cypress/screenshots/
+          retention-days: 14
+
       - name: Deploy to Netlify
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: nwtgck/actions-netlify@v3
