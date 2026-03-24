@@ -1,4 +1,4 @@
-name: Build, Test & Deploy
+name: Build & Test
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [master]
 
 jobs:
-  build-test-deploy:
+  build-and-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,14 +26,16 @@ jobs:
       - name: Build site
         run: npm run build
 
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-
-      - name: Run E2E tests against localhost
+      - name: Start preview server
         run: |
           npx astro preview --port 4321 &
           sleep 3
-          BASE_URL=http://localhost:4321 npx playwright test
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright E2E tests
+        run: BASE_URL=http://localhost:4321 npx playwright test
         env:
           CI: true
 
@@ -45,11 +47,8 @@ jobs:
           path: playwright-report/
           retention-days: 14
 
-      - name: Run Cypress tests against localhost
-        run: |
-          npx astro preview --port 4322 &
-          sleep 3
-          CYPRESS_BASE_URL=http://localhost:4322 npx cypress run --config-file cypress.config.cjs
+      - name: Run Cypress E2E tests
+        run: CYPRESS_BASE_URL=http://localhost:4321 npx cypress run --config-file cypress.config.cjs
         env:
           CI: true
 
@@ -58,40 +57,24 @@ jobs:
         if: failure()
         with:
           name: cypress-screenshots
-          path: tests/cypress/screenshots/
+          path: cypress/screenshots/
           retention-days: 14
 
-      - name: Deploy to Netlify
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        uses: nwtgck/actions-netlify@v3
-        with:
-          publish-dir: ./dist
-          production-deploy: true
-        env:
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
-
       - name: Install k6
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           curl -fsSL https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz | tar xzf - --strip-components=1
           sudo mv k6 /usr/local/bin/
 
-      - name: Wait for Netlify deployment to propagate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        run: sleep 15
-
       - name: Run k6 performance tests
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           mkdir -p tests/k6/results
           k6 run tests/k6/performance.js
         env:
-          BASE_URL: https://paulyardleyqa.co.uk
+          BASE_URL: http://localhost:4321
 
       - name: Upload k6 results
         uses: actions/upload-artifact@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !cancelled()
+        if: ${{ !cancelled() }}
         with:
           name: k6-performance-report
           path: tests/k6/results/
