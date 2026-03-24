@@ -1,5 +1,10 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
+import ProjectCard from '../../components/ProjectCard.astro';
+import { getCollection } from 'astro:content';
+
+const allProjects = await getCollection('projects', ({ data }) => !data.draft);
+const projects = allProjects.sort((a, b) => a.data.order - b.data.order);
 ---
 
 <BaseLayout title="Portfolio — Paul Yardley QA" description="QA case studies and project highlights from Paul Yardley's career in software testing.">
@@ -10,15 +15,29 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
         Real-world case studies showcasing my testing strategies, tools, and measurable results.
       </p>
 
-      <!-- Placeholder for Phase 2 content collection -->
-      <div class="bg-slate-100 dark:bg-slate-800 rounded-xl p-12 text-center border-2 border-dashed border-slate-300 dark:border-slate-600">
-        <p class="text-slate-500 dark:text-slate-400 text-lg">
-          Case studies coming soon — Phase 2 content.
-        </p>
-        <p class="text-sm text-slate-400 dark:text-slate-500 mt-2">
-          This section will feature detailed project write-ups with the testing strategy, tools used, and quantified results.
-        </p>
-      </div>
+      {projects.length > 0 ? (
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {projects.map((project) => (
+            <ProjectCard
+              title={project.data.title}
+              description={project.data.description}
+              industry={project.data.industry}
+              role={project.data.role}
+              duration={project.data.duration}
+              tools={project.data.tools}
+              scope={project.data.scope}
+              slug={project.id}
+              results={project.data.results}
+            />
+          ))}
+        </div>
+      ) : (
+        <div class="bg-slate-100 dark:bg-slate-800 rounded-xl p-12 text-center border-2 border-dashed border-slate-300 dark:border-slate-600">
+          <p class="text-slate-500 dark:text-slate-400 text-lg">
+            Case studies coming soon.
+          </p>
+        </div>
+      )}
     </div>
   </section>
 </BaseLayout>

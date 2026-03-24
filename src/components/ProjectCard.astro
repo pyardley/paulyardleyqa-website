@@ -1,0 +1,76 @@
+---
+interface Result {
+  metric: string;
+  value: string;
+}
+
+interface Props {
+  title: string;
+  description: string;
+  industry: string;
+  role: string;
+  duration: string;
+  tools: string[];
+  scope: string[];
+  slug: string;
+  results?: Result[];
+}
+
+const { title, description, industry, role, duration, tools, scope, slug, results } = Astro.props;
+---
+
+<article class="group bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 hover:border-teal/50 transition-all duration-300 hover:shadow-lg hover:shadow-teal/5">
+  <a href={`/portfolio/${slug}`} class="block p-6">
+    <!-- Header -->
+    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400 mb-3">
+      <span class="font-semibold text-teal">{industry}</span>
+      <span class="w-1 h-1 rounded-full bg-slate-400" aria-hidden="true"></span>
+      <span>{role}</span>
+      <span class="w-1 h-1 rounded-full bg-slate-400" aria-hidden="true"></span>
+      <span>{duration}</span>
+    </div>
+
+    <h2 class="text-xl font-bold text-slate-800 dark:text-white mb-2 group-hover:text-teal transition-colors">
+      {title}
+    </h2>
+
+    <p class="text-slate-600 dark:text-slate-300 text-sm mb-4 line-clamp-3">
+      {description}
+    </p>
+
+    <!-- Scope Tags -->
+    <div class="flex flex-wrap gap-1.5 mb-4">
+      {scope.map((item) => (
+        <span class="px-2 py-0.5 text-xs font-medium rounded-full bg-teal/10 text-teal">
+          {item}
+        </span>
+      ))}
+    </div>
+
+    <!-- Tools -->
+    <div class="flex flex-wrap gap-1.5 mb-4">
+      {tools.slice(0, 5).map((tool) => (
+        <span class="px-2 py-0.5 text-xs rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300">
+          {tool}
+        </span>
+      ))}
+      {tools.length > 5 && (
+        <span class="px-2 py-0.5 text-xs rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500">
+          +{tools.length - 5} more
+        </span>
+      )}
+    </div>
+
+    <!-- Results Preview -->
+    {results && results.length > 0 && (
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-4 border-t border-slate-100 dark:border-slate-700">
+        {results.slice(0, 3).map((result) => (
+          <div>
+            <p class="text-sm font-bold text-slate-800 dark:text-white">{result.value}</p>
+            <p class="text-xs text-slate-500 dark:text-slate-400">{result.metric}</p>
+          </div>
+        ))}
+      </div>
+    )}
+  </a>
+</article>

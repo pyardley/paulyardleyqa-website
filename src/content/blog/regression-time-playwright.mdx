@@ -1,0 +1,178 @@
+---
+title: "How I Cut Regression Time by 81% with Playwright + GitHub Actions"
+description: "A practical guide to building a Playwright E2E test suite that transformed our release process from painful fortnightly deploys to confident weekly releases."
+pubDate: 2026-03-24
+author: "Paul Yardley"
+tags:
+  ["Playwright", "Test Automation", "CI/CD", "GitHub Actions", "E2E Testing"]
+readingTime: "8 min read"
+---
+
+Every QA engineer has been there: it's release day, the manual regression checklist is 200 items long, and you're three hours in wondering if you missed something critical. That was my reality until I built a Playwright test suite that changed everything.
+
+In this post, I'll share exactly how I went from 4-hour manual regression cycles to 45-minute automated runs — and the lessons I learned along the way.
+
+## The Problem
+
+Our e-commerce platform had grown organically over 5 years. The test strategy hadn't kept pace:
+
+- **200+ manual test cases** executed before every release
+- **4+ hours** of regression testing per deploy
+- **Fortnightly releases** because nobody wanted to go through regression more often
+- **~1 production incident per month** despite the manual effort
+
+The business wanted weekly releases. The maths didn't work with manual testing.
+
+## Why Playwright?
+
+I evaluated three frameworks before committing:
+
+| Criterion                    | Playwright | Cypress   | Selenium  |
+| ---------------------------- | ---------- | --------- | --------- |
+| Multi-browser (incl. Safari) | ✅         | ❌        | ✅        |
+| Built-in API testing         | ✅         | ❌        | ❌        |
+| Parallel execution           | ✅ Native  | ✅ (paid) | ✅ (Grid) |
+| Auto-waiting                 | ✅         | ✅        | ❌        |
+| Setup complexity             | Low        | Low       | High      |
+| Speed                        | Fast       | Medium    | Slow      |
+
+**Playwright won** because:
+
+1. **28% of our users were on Safari** — we needed WebKit testing, and Cypress didn't support it.
+2. **API + UI in one tool** — seeding test data via API calls within Playwright tests meant fewer moving parts.
+3. **Free parallelism** — Cypress charged for parallel execution in CI; Playwright included it.
+
+## The Implementation Plan
+
+I didn't try to automate everything at once. The key was **prioritising by risk**:
+
+### Week 1-2: The Critical Path
+
+```
+Checkout flow: Search → Product → Cart → Payment → Confirmation
+```
+
+This single flow covered the highest-risk user journey and touched 60% of the codebase. Automating it first gave us immediate confidence.
+
+### Week 3-4: API Contract Tests
+
+```typescript
+test("GET /api/products should return valid schema", async ({ request }) => {
+  const response = await request.get("/api/products?limit=10");
+  expect(response.status()).toBe(200);
+
+  const data = await response.json();
+  expect(data.products).toBeInstanceOf(Array);
+  expect(data.products[0]).toHaveProperty("id");
+  expect(data.products[0]).toHaveProperty("price");
+  expect(data.products[0].price).toBeGreaterThan(0);
+});
+```
+
+23 API endpoints validated for schemas, error codes, and edge cases.
+
+### Week 5-8: Expanding Coverage
+
+- User account management (registration, login, password reset)
+- Search and filtering
+- Responsive testing across 3 viewports
+- Accessibility scanning with axe-core
+
+## The Three Biggest Challenges
+
+### 1. Flaky Payment Tests
+
+The payment sandbox had random 3-5 second delays, causing 15% of runs to fail with timeouts.
+
+**Solution:** A targeted retry strategy:
+
+```typescript
+// Custom retry for payment-specific assertions
+async function waitForPayment(page, timeout = 15000) {
+  await expect(page.locator('[data-testid="payment-success"]')).toBeVisible({
+    timeout,
+  });
+}
+```
+
+Combined with a mock payment gateway for tests that weren't specifically testing payments. Flakiness dropped from 15% to under 1%.
+
+### 2. Test Data Isolation
+
+Early on, tests shared a database. Test A would create an order, Test B would cancel it, and Test C would fail because the order was gone.
+
+**Solution:** A `TestDataFactory` that provisioned isolated data via API:
+
+```typescript
+test.beforeEach(async ({ request }) => {
+  const user = await TestDataFactory.createUser(request);
+  const product = await TestDataFactory.createProduct(request);
+  // Each test gets its own clean state
+});
+```
+
+### 3. Slow CI Pipeline
+
+150 tests took 25 minutes on a single runner. PR reviewers stopped waiting.
+
+**Solution:** Playwright's built-in sharding:
+
+```yaml
+strategy:
+  matrix:
+    shard: [1/4, 2/4, 3/4, 4/4]
+steps:
+  - run: npx playwright test --shard=${{ matrix.shard }}
+```
+
+25 minutes → 7 minutes. Developers started trusting the pipeline again.
+
+## The Results
+
+After 6 months:
+
+| Metric               | Before      | After         |
+| -------------------- | ----------- | ------------- |
+| Regression time      | 4 hours     | 45 minutes    |
+| Automation coverage  | 12%         | 87%           |
+| Release frequency    | Fortnightly | Weekly        |
+| Production incidents | ~1/month    | 1 in 6 months |
+| Test flakiness       | N/A         | &lt;1%        |
+
+## Lessons Learned
+
+### 1. Start with Risk, Not Coverage
+
+It's tempting to aim for 100% coverage. Don't. Automate the flows that cause the most pain when they break. For us, that was checkout and payment — 20% of the user journeys but 80% of the production incidents.
+
+### 2. Fast CI or No CI
+
+If your CI pipeline takes longer than a coffee break, developers will merge without waiting for it. The sharding investment paid for itself within the first week.
+
+### 3. Invest in Test Data Early
+
+Shared test data is the #1 cause of flaky tests. The upfront cost of building a `TestDataFactory` saves hundreds of hours of debugging mysterious failures.
+
+### 4. Playwright's API Testing is Underrated
+
+Most teams use Playwright only for UI tests and Postman for APIs. Using Playwright's `request` context for both means:
+
+- One language, one framework, one CI pipeline
+- Test data can be seeded and verified in the same test
+- No context-switching between tools
+
+## Getting Started
+
+If you're considering a similar migration, here's my recommended order:
+
+1. **Pick your highest-risk user journey** and automate it end-to-end
+2. **Set up CI** with Playwright's GitHub Actions example (it takes 10 minutes)
+3. **Add API tests** for your most critical endpoints
+4. **Implement test data isolation** before your suite grows
+5. **Add sharding** when CI time exceeds 10 minutes
+
+The hardest part isn't the technical implementation — it's convincing the team to trust the automation. Start small, prove the value, and let the results speak for themselves.
+
+---
+
+_Have questions about migrating to Playwright? [Get in touch](/contact) — I'm always happy to talk testing._
