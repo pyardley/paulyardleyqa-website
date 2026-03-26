@@ -1,0 +1,225 @@
+---
+title: "The File Was Fixed-Field Format and Over 1,000 Characters Wide. How to Test?"
+description: "The CAIS credit referencing agencies feed follows a strict fixed-width field format that would be incredibly laborious to test manually. Here I discuss the approach I took using SoapUI and Groovy to automate verification of every field."
+industry: "Car Finance"
+role: "Test Analyst"
+duration: "Project-based"
+tools: ["SoapUI", "Groovy", "Oracle", "JDBC", "SQL"]
+scope:
+  [
+    "Test Automation",
+    "Data Verification",
+    "Credit Reporting",
+    "Fixed-Field Format",
+  ]
+order: 3
+results:
+  - metric: "Fields Verified"
+    value: "35+ per record"
+  - metric: "Verification Steps"
+    value: "30+ automated JDBC checks"
+  - metric: "Verification Time"
+    value: "Under 10 minutes"
+---
+
+When a loan management system generates a CAIS (Credit Account Information Sharing) file for credit reference agencies, every character position matters. A single byte out of place can misreport a customer's credit status to Experian or Equifax. The consumer record format alone is **530 characters wide**, with over 35 fields packed into fixed-width positions — and the corporate format stretches beyond **1,360 characters**.
+
+Manual verification? You'd need a ruler and a lot of patience. Here's how I automated the entire process using SoapUI's Groovy scripting and JDBC test steps.
+
+## What Is a CAIS File?
+
+CAIS is the UK standard for sharing credit account data between lenders and credit reference agencies. The file format is strictly defined: each record is a fixed-width line where field positions are specified down to the individual character. The format version used here was **CAIS2007**.
+
+A typical consumer CAIS file contains three record types:
+
+1. **Header record** — identifies the source, creation date, and company name
+2. **Data records** — one per account/customer combination, containing account details, balances, statuses, and personal information
+3. **Trailer record** — contains a record count for reconciliation
+
+The header is identified by the text `HEADER` padded to 20 characters. The trailer is identified by a string of twenty 9s (`99999999999999999999`). Everything in between is account data.
+
+## The Challenge
+
+The system under test was a loan management platform backed by an **Oracle database**. A batch process would read account data from multiple database tables — loans, customers, addresses, arrears, payment schedules — and produce CAIS-format flat files. Each file was named following a convention like `calms_CO01_243_consumer_2020010342.cais`, encoding the company code, CAIS source code, and a date-based identifier.
+
+The verification challenge was threefold:
+
+- **Field-level accuracy**: Is each of the 35+ fields in the correct character position with the correct value?
+- **Data derivation logic**: Are computed fields (like account status codes and flag settings) correctly derived from the source database tables?
+- **Structural integrity**: Does the header date match the system date? Does the trailer count match the actual number of records?
+
+## The Approach: Import, Parse, Then Verify
+
+Rather than trying to validate the flat file in isolation, I designed a three-phase test:
+
+### Phase 1: Import the CAIS File into a Database Table
+
+The first Groovy test step scans a directory for consumer CAIS files, parses each line by character position, and inserts the extracted fields into temporary Oracle tables. This effectively "reverses" the file generation — turning the flat file back into structured data that can be queried.
+
+```groovy
+// Scan for consumer CAIS files
+new File("C:/temp/cais").eachFile() {
+    file -> fileName = file.getName()
+    if (fileName.contains('.cais') && fileName.contains('_consumer_')) {
+        fileNameList << fileName
+    }
+}
+```
+
+Each data record is parsed using substring operations at the exact character positions defined in the CAIS specification:
+
+```groovy
+String accountNum = line.substring(0, 10)            // Account Number
+String accountType = line.substring(20, 22)           // Account Type
+int startDate = line.substring(22, 30).toInteger()    // Start Date
+int closeDate = line.substring(30, 38).toInteger()    // Close Date
+String paymentAmt = line.substring(38, 44)            // Monthly Payment
+int repaymentPeriod = line.substring(44, 47).toInteger()  // Repayment Period
+int curBal = line.substring(47, 54).toInteger()       // Current Balance
+String creditBalInd = line.substring(54, 55)          // Credit Balance Indicator
+String accountStatusCode = line.substring(55, 56)     // Account Status Code
+String flagSetting = line.substring(264, 265)         // Flag Settings
+String nameAndAddress = line.substring(265, 440)      // Name and Address
+int dateOfBirth = line.substring(447, 455).toInteger() // Date of Birth
+// ... and so on for all 35+ fields up to position 530
+```
+
+The header record is also validated during import — checking that it contains `CAIS2007`, that the creation date matches the system's last reporting date (retrieved from the `LSETUP` configuration table), and that reserved/blank fields are genuinely blank.
+
+### Phase 2: Prepare Reference Data
+
+Before running the field-level assertions, the test prepares supporting reference data:
+
+- A **payment schedule summary** (`temp_shed`) is built from the `LSHED` (loan schedule) table, calculating the most common monthly payment amount per account
+- A **credit reporting status table** (`LCRAREP`) captures the current and previous account statuses and flag settings, linking loan references to customer account masters
+
+These temporary tables provide the "expected" values that the CAIS file should contain.
+
+### Phase 3: Field-by-Field Verification via JDBC
+
+This is where the real testing happens. Each CAIS field gets its own dedicated **JDBC test step** that joins the imported file data (`temp_consumer`) with the source database tables and compares actual vs expected values.
+
+The test case contains over **30 individual JDBC verification steps**, each with Groovy script assertions that iterate over every row in the result set. Here's what was verified:
+
+## The Field Verification Matrix
+
+### Dynamic Fields (Compared Against Source Database)
+
+These fields require complex SQL joins to derive the expected value:
+
+| Field                    | Verification Logic                                                                                                                                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **FILENAME**             | Reconstructed from company code, CAIS source code, and reporting date; compared against the actual filename in the file                                                                                                 |
+| **ACCOUNT_TYPE**         | Joined to `LMCLOAN` and `p_product` tables; the product's `PRODUCT_CAIS_CODE` must match the file's account type                                                                                                        |
+| **START_DATE**           | The loan's `MCLOAN_START_DATE` is reformatted from `DDMMYY` to `DDMMYYYY` and compared                                                                                                                                  |
+| **CLOSE_DATE**           | Derived conditionally — if account status is `8` (defaulted), uses the status date from `LYTRAN`; otherwise uses the payoff quote date from `LPOQOT`; defaults to `00000000`                                            |
+| **MNTLY_PAYMENT_AMOUNT** | Only populated for specific account types (`01`, `02`, `19`, `29`, `51`); derived from the loan payment schedule (`LSHED`) using the most frequent instalment amount                                                    |
+| **REPAYMENT_PERIOD**     | Only populated for account types `01`, `02`, `03`, `19`, `20`, `22`; sourced from `MCLOAN_TERM`                                                                                                                         |
+| **CURRENT_BAL**          | The absolute rounded value of `MCLOAN_CUR_BAL` from the loan master                                                                                                                                                     |
+| **ACCOUNT_STATUS_CODE**  | Matched against the `LCRAREP` reporting table's `CURRENT_STATUS`, joining through loan references and customer account masters                                                                                          |
+| **FLAG_SETTING**         | Matched against `LCRAREP.CURRENT_FLAG` using the same join path as account status                                                                                                                                       |
+| **NAME_AND_ADDRESS**     | Reconstructed from `LACMSTR` (customer master) and `LADDRS2` (address) tables — title, first name, surname concatenated into 39 characters, followed by building, street, town, and county each padded to 32 characters |
+| **POSTCODE**             | Compared against `ADDRS2_POST_CODE` from the primary mailing address                                                                                                                                                    |
+| **DATE_OF_BIRTH**        | Reformatted from the customer master's 6-digit `ACCT_BIRTH_DATE` to 8-digit `DDMMYYYY` format                                                                                                                           |
+
+### Static/Default Fields (Verified as Constant Values)
+
+Many fields in the consumer CAIS format are not populated by this particular system. The test verifies they contain the correct default:
+
+| Field                         | Expected Value           |
+| ----------------------------- | ------------------------ |
+| **CRED_BAL_IND**              | Blank/null (all records) |
+| **SPECIAL_INS_IND**           | Blank/null (all records) |
+| **EXPERIAN_BLOCK**            | Blank/null (all records) |
+| **PAYMENT_AMOUNT**            | `000000`                 |
+| **CREDIT_PAYMENT_IND**        | Blank/null               |
+| **PREV_STATEMENT_BAL**        | `000000`                 |
+| **PREV_STATEMENT_BAL_IND**    | Blank/null               |
+| **NUM_CASH_ADVANCES**         | `00`                     |
+| **VAL_CASH_ADVANCES**         | `000000`                 |
+| **PAYMENT_CODE**              | Blank/null               |
+| **PROMO_ACTIVITY_FLAG**       | Blank/null               |
+| **FILLER**                    | Blank/null               |
+| **TRANS_ASSOC_FLAG**          | Blank/null               |
+| **AIRTIME_RETAILER_FLAG**     | Blank/null               |
+| **CREDIT_LIMIT**              | `0000000`                |
+| **FILLER2**                   | Blank/null               |
+| **BAL_TYPE**                  | Blank/null               |
+| **CREDIT_TURNOVER**           | `000000000`              |
+| **PRIMARY_ACC_IND**           | Blank/null               |
+| **DEFAULT_SATISFACTION_DATE** | `00000000`               |
+| **TRANS_FLAG**                | Blank/null               |
+| **FILLER3**                   | Blank/null               |
+| **ORIG_DEFAULT_BAL**          | `0000000`                |
+| **PAY_FREQ_IND**              | `M` (Monthly)            |
+| **NEW_ACCOUNT_NUM**           | Blank/null               |
+
+For the static fields, the assertion pattern uses a `GROUP BY` count to confirm every single record has the expected value — if the count returns more than one group, something is wrong:
+
+```groovy
+// Groovy assertion: all records must have the same value
+String resp = holder.xml
+int rowCount = resp.count("<Row rowNumber=")
+assert rowCount == 1  // Only one distinct value should exist
+```
+
+### The Name and Address Verification
+
+The most complex verification was the **NAME_AND_ADDRESS** field — 175 characters that concatenate customer name and address data from multiple tables. The test reconstructs the expected value using the same padding rules the batch process should follow:
+
+```sql
+-- Expected name: Title + First Name + Surname, trimmed and concatenated
+CONCAT(CONCAT(CONCAT(TRIM(ACCT_TITLE), ' '),
+  CONCAT(TRIM(ACCT_FIRST_NAME), ' ')),
+  TRIM(ACCT_SURNAME)) as EXP_NAME
+
+-- Expected address: Building, Street, Town, County each right-padded to 32 chars
+RPAD(CONCAT(CONCAT(CONCAT(BUILDING, STREET), TOWN), COUNTY), 128, ' ')
+```
+
+Three separate Groovy assertions validate the name, address, and postcode independently — so when a failure occurs, you immediately know which component is wrong.
+
+## Why SoapUI?
+
+SoapUI might seem like an unusual choice for file verification, but it offered several advantages for this particular problem:
+
+1. **JDBC test steps** provided native Oracle connectivity with built-in result set handling and XML-based assertion capabilities
+2. **Groovy scripting** gave full Java library access for file I/O, string manipulation, and complex parsing logic
+3. **Sequential test step execution** with configurable delays between steps avoided overwhelming the database connection pool
+4. **Built-in logging** made debugging straightforward — every SQL statement and intermediate value was logged
+5. **Reusable project properties** for environment configuration (`envNoPort`, `oraclePort`) meant the same test ran across dev, test, and pre-production
+6. **SOAP Requests for setup** were right there in the same project to create the companies and customers as required
+
+## Lessons Learned
+
+### 1. Parse the File into a Queryable Format First
+
+The single best decision was importing the flat file into a database table before attempting any verification. This transformed an unwieldy string-parsing problem into straightforward SQL comparisons. It also meant the test data was visible in any SQL client for ad-hoc investigation when tests failed.
+
+### 2. Verify Static Fields — Don't Assume Them
+
+It's tempting to skip fields that should always be blank or zero. Don't. A code change that accidentally shifts field positions by even one character will corrupt every subsequent field. The static field checks act as a **positional integrity guard** — if `PAYMENT_CODE` suddenly has a value, it likely means the fields before it have shifted.
+
+### 3. Separate "What" from "How"
+
+Each JDBC step tests exactly one field. This means a failure immediately tells you _what_ is wrong without debugging. The trade-off is a large number of test steps (30+), but the diagnostic clarity is worth it.
+
+### 4. Configurable Delays Matter
+
+The test includes delay steps between each JDBC verification. This prevented connection pool exhaustion and allowed the Oracle query optimiser to release resources between queries. A small `delay` property (750ms) made the difference between reliable execution and intermittent connection failures.
+
+### 5. Handle Corporate Files Separately
+
+The corporate CAIS format is fundamentally different — over 1,360 characters per record with company-specific fields like registered address, SIC code, VAT number, and director information. The test included a framework for corporate file parsing (visible in the disabled test steps), but the formats are different enough to warrant completely separate test cases.
+
+## The Bottom Line
+
+Testing fixed-width file formats is inherently tedious and error-prone when done manually. By combining SoapUI's Groovy scripting for file parsing with JDBC test steps for database-driven verification, I built an automated suite that could validate every character position in a 530-character CAIS record against its source data - and run it all in under 10 minutes.
+
+The approach caught multiple defects in the code. The dev was curious as to how I was able to test files so quickly. I showed him the test suite and he then used it himself, short circuiting the usual daily build cycle to quickly get his code bug free.
+
+When the data matters this much, automation isn't optional.
+
+---
+
+_Working with fixed-format files or credit reporting systems? [Get in touch](/contact) — I've been testing these systems for years and I'm happy to share what I've learned._

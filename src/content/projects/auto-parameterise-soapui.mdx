@@ -1,0 +1,268 @@
+---
+title: "Hardcoded Dates in 2,000-Line SOAP Requests? Auto-Parameterise Them with Groovy"
+description: "When every SOAP test request contains hardcoded dates, contract numbers and environment-specific values, running tests for different date scenarios or environment meant hours of manual edits. Here's how I built a SoapUI Groovy utility to automatically parameterise XML requests - replacing static values with dynamic property references in seconds."
+industry: "Car Finance"
+role: "Test Analyst"
+duration: "2 years"
+tools: ["SoapUI", "Groovy", "SOAP", "Oracle", "Regex"]
+scope: ["Test Automation", "API Testing", "Parameterisation"]
+order: 2
+results:
+  - metric: "Request Prep Time"
+    value: "30–60 minutes → under 1 second"
+  - metric: "Fields Auto-Parameterised"
+    value: "20+"
+---
+
+The car finance application I was testing was split into two separate parts:
+
+- **Front Office** was used in car dealerships to take customer preferences such as contract type and term. When the customer was happy, a SOAP request was sent to the backend
+- **Back Office** took the SOAP request produced by the Front Office and created a contract, starting the process of collecting payments, processing arrears etc.
+
+In order to avoid having to go through the full Front Office procedure of creating a customer contract, we could store the xml generated and reuse it for our testing. However, a single contract activation request could span **2,000+ lines of XML** - packed with dates, contract numbers, payment schedules and reference identifiers that were all hardcoded to specific values. Run that test tomorrow and every date is wrong. Point it at a different environment and every contract number collides.
+
+Manually updating these values across dozens of test requests was eating hours. Here's how I automated the entire process using SoapUI's Groovy scripting to auto-parameterise SOAP requests in seconds.
+
+## The Problem
+
+The system under test was **Calms2CMS** - a SOAP web service for activating bundled finance contracts (hire purchase, PCP, leasing) in a contract management system. A typical `createContractBundle` request contained:
+
+- **Start dates, payment dates, commission dates** - all hardcoded to specific calendar dates
+- **Invoice due dates** - one per payment in a 12–60 month schedule, each a specific date
+- **Contract numbers, proposal IDs, component identifiers** - numeric values tied to a specific test run
+- **Registration numbers, VINs, document references** - alphanumeric identifiers that must be unique per execution
+- **Billing days, security numbers, asset IDs** - values that depend on the target environment's current state
+
+Every time we needed to re-run a test, someone had to manually find-and-replace dozens of values across thousands of lines of XML. Worse, the date logic wasn't simple substitution - invoice due dates needed to increment month by month from a calculated start date, and that start date itself depended on the environment's current **Interest Debit Date** pulled from the database.
+
+## The Approach: Scan, Detect, Replace
+
+Rather than editing requests by hand, I built a Groovy script that processes any SOAP request test step automatically - scanning the XML line by line, detecting known field patterns via regex, and replacing hardcoded values with SoapUI property expansion expressions.
+
+### Step 1: Find the Target Request
+
+The script first discovers which request test step to process by iterating through all steps in the current test case and finding the last enabled request step:
+
+```groovy
+String testStepName = ""
+testRunner.testCase.testStepList.each {
+    String testStep = it.name
+    def myTestStep = testRunner.testCase.getTestStepByName(testStep)
+    if (!myTestStep.disabled) {
+        if (myTestStep.config.type.toString().contains("request")) {
+            testStepName = testStep
+        }
+    }
+}
+```
+
+This means you simply enable whichever request you want to parameterise, run the script, and it finds it automatically.
+
+### Step 2: Detect Lease vs Finance
+
+The replacement logic for payment dates differs between lease and finance contracts. For a **finance** (hire purchase) contract, the first payment date is one month after the start date. For a **lease**, the first payment falls on the start date itself. The script detects this by scanning for the `<isLease>` element:
+
+```groovy
+String isLease = ""
+for (String line : splitRequest) {
+    if (line =~ /<(.*:)?isLease>/) {
+        line = line - ~/<isLease>/
+        line = line - ~/<\/isLease>/
+        isLease = line - ~/ */
+    }
+}
+```
+
+This drives the conditional logic for `firstPaymentDate` and `invoiceDueDate` offsets throughout the rest of the script.
+
+### Step 3: Line-by-Line Parameterisation
+
+The core of the script loops through every line of the XML request, matching element names with regex and replacing their hardcoded values with SoapUI property references. The replacement uses a `£` symbol as a temporary placeholder for `$` to avoid premature property expansion:
+
+```groovy
+if (curLine =~ /<(.*:)?startDate>/) {
+    curLine = curLine.replaceAll(
+        "[0-9]{4}-[0-9]{2}-[0-9]{2}.*<",
+        '£{#TestCase#StartDate}<'
+    ).replace('£', '$')
+}
+```
+
+The regex `[0-9]{4}-[0-9]{2}-[0-9]{2}.*<` matches any ISO date up to the closing angle bracket, replacing it with `${#TestCase#StartDate}`. The namespace-agnostic pattern `<(.*:)?elementName>` ensures it works regardless of XML namespace prefixes.
+
+## The Replacement Matrix
+
+The script handles over 20 different XML elements, each mapped to the appropriate SoapUI property scope:
+
+### Date Fields
+
+| XML Element                        | Replaced With                                                         | Notes                    |
+| ---------------------------------- | --------------------------------------------------------------------- | ------------------------ |
+| `startDate`                        | `${#TestCase#StartDate}`                                              | Contract start           |
+| `quoteCalculationDate`             | `${#TestCase#StartDate}`                                              | Same as start            |
+| `commissionDate`                   | `${#TestCase#StartDate}`                                              | Same as start            |
+| `firstPaymentDate`                 | `${#TestCase#StartDatePlus00}` (lease) or `StartDatePlus01` (finance) | Lease/finance aware      |
+| `invoiceDueDate`                   | `${#TestCase#StartDatePlusNN}`                                        | NN = payment number      |
+| `registrationDate`                 | `${#TestCase#RegistrationDate}`                                       | Vehicle registration     |
+| `proposalApprovalDate`             | `${#TestCase#RegistrationDate}`                                       | Approval date            |
+| `lastUpdated`, `timestamp`         | `${#Project#InterestDebitDate}`                                       | Preserves time component |
+| `docDate`                          | `${#Project#SysDate}`                                                 | Current system date      |
+| `customerIssueDate`, `receiptDate` | `${#Project#InterestDebitDate}`                                       | Environment-specific     |
+
+### Identifier Fields
+
+| XML Element              | Replaced With                                       | Notes                      |
+| ------------------------ | --------------------------------------------------- | -------------------------- |
+| `externalContractNumber` | `${#TestSuite#contractNumber}`                      | Master contract ref        |
+| `proposalId`             | `${#TestSuite#contractNumber}`                      | Proposal reference         |
+| `uniqueReference`        | `contractNumber` + zero-padded suffix (e.g., `001`) | Per-contract within bundle |
+| `linkReference`          | `contractNumber` + zero-padded suffix               | Cross-reference link       |
+| `componentIdentifier`    | `contractNumber` + 5-digit suffix (e.g., `00001`)   | Component-level ID         |
+| `billingDay`             | `${#TestSuite#BillingDay}`                          | Day of month for billing   |
+| `securityNumber`         | `${#Project#secNumber}`                             | Security reference         |
+| `assetId`                | `${#Project#secNumber1}`                            | Asset identifier           |
+| `registrationNumber`     | `REG${#TestSuite#contractNumber}`                   | Prefixed registration      |
+| `vin`                    | `VIN${#TestSuite#contractNumber}XXXX`               | Prefixed VIN               |
+| `documentID`             | `11${#Project#docNumber}`                           | Document reference         |
+| `referenceNumber`        | `111${#Project#docNumber}`                          | General reference          |
+| `orderNumber`            | `${#Project#contractNumber}`                        | Order reference            |
+
+### Invoice Due Date - The Complex One
+
+Invoice due dates required special handling because each payment in the schedule needs a different date offset. The script tracks the current payment number from the `<no>` element and uses it to construct the property name:
+
+```groovy
+if (curTag == "no") {
+    payment = curValue as Integer
+}
+if (curTag == "invoiceDueDate") {
+    if (isLease.contains("true")) {
+        payment--  // Lease payments start one period earlier
+    }
+    curLine = curLine.replaceAll(
+        "[0-9]{4}-[0-9]{2}-[0-9]{2}.*<",
+        '£{#TestCase#StartDatePlus' +
+        payment.toString().padLeft(2, "0") +
+        '}<'
+    ).replace('£', '$')
+}
+```
+
+For a 12-month finance contract, this generates references from `${#TestCase#StartDatePlus01}` through `${#TestCase#StartDatePlus12}`. For a lease, the offset shifts down by one - `StartDatePlus00` through `StartDatePlus11`.
+
+## Calculating the Dynamic Values
+
+The parameterised request is only half the solution. The property values themselves need to be calculated at runtime, relative to the test environment's current state. A separate Groovy setup step handles this:
+
+### Deriving the Start Date from the Database
+
+The script connects to the Oracle database to retrieve the **Interest Debit Date (IDD)** - the environment's current processing date - then winds back by `(term − 1)` months to calculate the contract start date:
+
+```groovy
+def sql = Sql.newInstance(
+    "jdbc:Oracle:thin:@" + envNoPort + ":" + oraclePort + "/ORCL",
+    "cms", "password", "oracle.jdbc.OracleDriver"
+)
+
+// Retrieve IDD from system configuration table
+String sqlStatement = "select to_Char(to_date(" +
+    "SUBSTR(UTL_RAW.CAST_TO_VARCHAR2(TABLE_DATA),3,6), " +
+    "'DDMMYY'), 'YYYY-MM-DD') IDD from CMS.LTABLE where table_type = 9"
+```
+
+The start date is then calculated by subtracting `(term − 1)` months from the IDD, ensuring the contract's maturity date lands one month after the current processing date:
+
+```groovy
+for (i = 1; i < intTerm; i++) {
+    MM--
+    if (MM == 0) { YYYY--; MM = 12 }
+}
+String startDate = YYYY + "-" + MM.toString().padLeft(2, "0") +
+    "-" + DD.toString().padLeft(2, "0")
+```
+
+### Generating Payment Date Properties
+
+A loop then creates all the `StartDatePlusNN` properties by incrementing month by month from the start date:
+
+```groovy
+for (i = 0; i <= intTerm; i++) {
+    MM++
+    if (MM > 12) { MM = 1; YYYY++ }
+    String newDate = YYYY + "-" + MM.toString().padLeft(2, "0") +
+        "-" + DD.toString().padLeft(2, "0")
+    testRunner.testCase.setPropertyValue(
+        "StartDatePlus" + i.toString().padLeft(2, "0"), newDate
+    )
+}
+```
+
+### Ensuring Unique Identifiers
+
+Contract numbers, document numbers, and security numbers are incremented from project-level properties and cross-checked against the database to avoid collisions:
+
+```groovy
+// Increment contract number
+int contractNo = Integer.parseInt(project.getPropertyValue("contractNumber"))
+contractNo = contractNo + 2
+project.setPropertyValue("contractNumber", contractNo.toString())
+
+// Get max document number from database to avoid collisions
+sqlStatement = "select max(SUBSTR(VRCDOC_REFERENCE,4)) MAXDOCNO from cms.LVRCDOC"
+sql.eachRow(sqlStatement) { row ->
+    docNo = Integer.parseInt(row.MAXDOCNO)
+}
+docNo = docNo + 1
+```
+
+## The Evolution: From Script to Reusable Library
+
+The solution went through three iterations, each improving maintainability:
+
+1. **Inline script** - All replacement logic hardcoded in a single 200-line Groovy script with dozens of if-statements. It worked, but duplicating it across test cases was painful.
+
+2. **External class** - The replacement logic was extracted into a reusable `UpdateRequest` class with a clean `AddConversion()` API. The main script became pure configuration:
+
+```groovy
+UpdateRequest u = new UpdateRequest(log)
+u.AddConversion("startDate", "${#TestCase#StartDate}")
+u.AddConversion("billingDay", "${#TestSuite#BillingDay}")
+u.AddConversion("registrationNumber", "REG${#TestSuite#contractNumber}")
+// ... configure all mappings
+String newRequest = u.UpdateAll(request)
+```
+
+3. **Internal SoapUI library** - The `UpdateRequest` class was moved into a dedicated "lib" test suite within the SoapUI project itself, loaded at runtime via `context`. This eliminated external file dependencies and made the project fully self-contained and portable:
+
+```groovy
+// Load the class from the internal library
+currentProject.testSuites["lib"]
+    .testCases["UtilClass"]
+    .testSteps["UpdateRequest"]
+    .run(testRunner, context)
+
+// Use it
+String newRequest = context.UpdateRequest.UpdateAll(request)
+```
+
+## The Final Workflow
+
+The complete automated workflow runs as follows:
+
+1. **Enable** the SOAP request test step you want to parameterise
+2. **Set** the offset from the current business date in months and days to backdate the start of the contract, along with other parameters
+3. **Run** the AutoParameterise test case
+4. The script **discovers** the enabled request, **detects** lease vs finance, and **replaces** all hardcoded values with property references
+5. The parameterised request is **cloned** into a "Run" test case with the updated content
+6. A setup step **queries the database** to calculate all date and identifier values
+7. The test executes with **fully dynamic, environment-aware values**
+
+What previously took 30–60 minutes of manual editing per request now completes in under a second - and works correctly regardless of which environment or calendar date the tests run against.
+
+## Key Takeaways
+
+- **Regex with namespace tolerance** (`<(.*:)?elementName>`) makes the script work across different SOAP message formats without modification
+- **SoapUI's property scoping** (TestCase → TestSuite → Project) provides a natural hierarchy for values with different lifetimes
+- **Database-driven date calculation** ensures tests always align with the environment's current processing state
+- **The `£` to `$` replacement trick** prevents SoapUI from trying to expand property references during the transformation step itself
+- **Evolving from inline script to internal library** dramatically improved maintainability - new field mappings are a single line of configuration rather than another if-block

@@ -56,3 +56,22 @@ html {
 .skip-link:focus {
   top: 0;
 }
+
+/* Shiki dual-theme support: swap to dark colours when .dark class is active */
+.dark .astro-code,
+.dark .astro-code span {
+  color: var(--shiki-dark) !important;
+  background-color: var(--shiki-dark-bg) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+/* Prevent prose inline-code styles from overriding Shiki syntax highlighting in pre blocks */
+.prose pre code {
+  background: transparent !important;
+  color: inherit !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  font-size: inherit !important;
+}
