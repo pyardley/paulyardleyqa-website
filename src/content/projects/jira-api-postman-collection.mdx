@@ -1,0 +1,196 @@
+---
+title: "Testing the Jira Cloud REST API End-to-End with Postman"
+description: "A Postman collection that exercises the Jira Cloud REST API through a complete issue lifecycle - creating, updating, linking, adding attachments, commenting and cleaning up - with structured test scripts covering happy path validation, negative testing, schema checks and non-functional assertions."
+industry: "Software / Project Management"
+role: "QA Engineer"
+duration: "Personal project"
+tools: ["Postman", "JavaScript", "Jira Cloud REST API", "JSON Schema", "Newman"]
+scope:
+  ["API Testing", "Test Automation", "Negative Testing", "Schema Validation"]
+order: 1
+results:
+  - metric: "API Requests"
+    value: "18 (12 happy path, 6 error/reporting)"
+  - metric: "Test Assertions"
+    value: "60+"
+  - metric: "HTTP Methods Covered"
+    value: "GET, POST, PUT, DELETE"
+---
+
+When looking for an API to build a comprehensive Postman testing project around, three criteria mattered: the API needed to be **reasonably complex** with real-world data structures, **well documented** so I could focus on test design rather than reverse-engineering endpoints, and **potentially useful** beyond a demo exercise. The Jira Cloud REST API ticked all three boxes.
+
+The full collection is available on GitHub: [github.com/pyardley/jira-postman-collection](https://github.com/pyardley/jira-postman-collection)
+
+## Why Jira?
+
+### 1. Reasonably Complex Real-World API
+
+Jira's REST API isn't a toy. It spans multiple API families - the core REST API v3 for issue CRUD operations and the Agile API for boards and sprints. Responses use nested structures like Atlassian Document Format (ADF) for descriptions and comments, paginated result sets for boards and sprints, and cross-referenced entities such as issue links, attachments, and custom fields. This complexity makes it a meaningful test target where simple status-code checks aren't enough - you need schema validation, deep field traversal, and data-integrity assertions.
+
+### 2. Well Documented
+
+Atlassian publishes detailed, versioned API documentation with request/response examples for every endpoint. This meant I could design tests against a known contract, verify field-level accuracy against documented behaviour, and build a collection that others can pick up and understand without guesswork. The documentation quality directly translates to test quality.
+
+### 3. Potential Real-World Usefulness
+
+Unlike a mock or sandbox API, this collection works against a live Jira Cloud instance. The patterns it demonstrates - automated issue creation, bulk linking, attachment handling, permission testing - are directly applicable to CI/CD pipelines, migration verification, and integration testing in real projects. If your team uses Jira, this collection can be adapted into a smoke test suite with minimal changes.
+
+## Collection Structure
+
+The collection is organised into four logical sections that mirror how you'd approach testing any API: verify connectivity, exercise the happy path, probe error conditions, then report and clean up.
+
+### Happy Path - Issue Lifecycle Workflow
+
+The core of the collection walks through a complete Jira issue lifecycle, with each request building on data from the previous step:
+
+| #   | Request                         | Method | What It Tests                                                             |
+| --- | ------------------------------- | ------ | ------------------------------------------------------------------------- |
+| 1   | **Get Myself**                  | `GET`  | Authentication validity, user identity confirmation                       |
+| 2   | **Get Priorities**              | `GET`  | Reference data retrieval, builds a priority lookup table                  |
+| 3   | **Get Board ID**                | `GET`  | Agile board discovery by name (case-insensitive matching)                 |
+| 4   | **Get Sprint ID**               | `GET`  | Sprint lookup within a board, chained from board ID                       |
+| 5   | **Create a Jira with one link** | `POST` | Issue creation with full field population including an initial issue link |
+| 6   | **Get Jira After Create**       | `GET`  | Validates every field on the newly created issue                          |
+| 7   | **Add link 2 to Jira**          | `POST` | Adds a second issue link to the created issue                             |
+| 8   | **Add link 3 to Jira**          | `POST` | Adds a third issue link                                                   |
+| 9   | **Attach file**                 | `POST` | File attachment upload via multipart form data                            |
+| 10  | **Update the Summary**          | `PUT`  | Modifies the issue summary field                                          |
+| 11  | **Add a Comment**               | `POST` | Adds a comment using ADF (Atlassian Document Format)                      |
+| 12  | **Get Jira After Updates**      | `GET`  | Full re-validation of all fields, links, attachment, and comment          |
+
+Each request stores key data - such as the created issue key, board ID, sprint ID and attachment ID - in collection variables, creating a chain where later requests depend on earlier results. This mirrors real workflow testing where state carries forward.
+
+### Error Conditions - Negative Testing
+
+The collection doesn't just test the happy path. Six dedicated requests verify that the API behaves correctly when things go wrong:
+
+- **Invalid authentication** - sends a deliberately bad API token and asserts a `401 Unauthorized` response with the expected error message
+- **Missing required fields** - attempts to create an issue without a summary, expecting `400 Bad Request` with the specific validation message `"You must specify a summary of the issue."`
+- **Missing project key** - attempts issue creation without a project identifier
+- **Invalid issue key** - fetches a non-existent issue, expecting `404 Not Found`
+- **Delete non-existent issue** - attempts to delete an already-deleted issue
+- **Permission denied** - attempts deletion with a user account lacking delete permissions, expecting `403 Forbidden`
+
+These negative tests are arguably more valuable than the happy path - they confirm the API's error contract is stable and that error messages are meaningful enough to diagnose issues.
+
+## Test Techniques Used
+
+### Variable Chaining
+
+Data flows between requests through collection variables. For example, the `Get Myself` request extracts the user's `accountId` and stores it for use in issue creation. The `Create a Jira` request captures the new issue `key` which is then used by every subsequent request. This eliminates hardcoded values and makes the collection portable across Jira instances.
+
+### Schema Validation
+
+The "Get Jira After Updates" request validates the full response against a JSON Schema, checking that the response structure contains the expected nested objects (`key`, `fields.project`, `fields.assignee`) with correct types. Individual sub-schemas are also applied to issue links and assignee objects:
+
+```javascript
+const schema = {
+  type: "object",
+  required: ["key", "fields"],
+  properties: {
+    key: { type: "string" },
+    fields: {
+      type: "object",
+      required: ["project", "assignee", "summary"],
+      properties: {
+        summary: { type: "string" },
+        project: {
+          type: "object",
+          required: ["key", "name"],
+        },
+        assignee: {
+          type: "object",
+          required: ["accountId", "emailAddress"],
+        },
+      },
+    },
+  },
+};
+
+pm.test("Full nested response matches schema", () => {
+  pm.response.to.have.jsonSchema(schema);
+});
+```
+
+### ADF Content Traversal
+
+Jira uses Atlassian Document Format - a JSON-based document structure - for rich text fields like descriptions and comments. The tests don't just check that a description exists; they traverse the ADF tree to verify the actual text content:
+
+```javascript
+runTest("Description (ADF) Structure & Content", () => {
+  const desc = jsonData?.fields?.description;
+  pm.expect(desc.type).to.eql("doc");
+  pm.expect(desc.version).to.eql(1);
+
+  let foundText = false;
+  desc.content.forEach((node) => {
+    if (node.type === "paragraph" && node.content) {
+      node.content.forEach((textNode) => {
+        if (textNode.text === expected.description) {
+          foundText = true;
+        }
+      });
+    }
+  });
+  pm.expect(foundText).to.be.true;
+});
+```
+
+### Dynamic Lookup Tables
+
+Rather than hardcoding priority names, the collection builds a lookup table by calling the priorities endpoint first. Later tests use this table to verify that the priority ID on an issue maps to the expected name - testing referential integrity rather than just string matching:
+
+```javascript
+const priorityTable = JSON.parse(
+  pm.collectionVariables.get("priorityLookupTable"),
+);
+const expectedPriorityName = priorityTable[jsonData.fields.priority.id];
+pm.expect(jsonData.fields.priority.name).to.eql(expectedPriorityName);
+```
+
+### Non-Functional Assertions
+
+Every request in the collection is subject to collection-level test scripts that check non-functional concerns automatically:
+
+- **Response time SLA** - asserts responses complete within 500ms (1000ms for the create operation)
+- **Security headers** - verifies HSTS is enabled with the expected `max-age` value
+- **Request tracking** - checks for the presence of Atlassian's `x-arequestid` header
+- **Rate limiting** - confirms `x-ratelimit-remaining` is above zero
+- **Response body validation** - verifies JSON parseability for all responses that should return JSON, and empty bodies for operations that should return none
+
+### Error Tracking with runTest Wrapper
+
+A `runTest` helper function wraps every assertion. If any test fails, it sets a global `ErrorFound` flag. The Final Summary Report request reads this flag and either passes the run or fails it with a clear message - making the collection suitable for automated pipeline execution where you need a single pass/fail outcome:
+
+```javascript
+function runTest(name, testFn) {
+  pm.test(name, () => {
+    try {
+      testFn();
+    } catch (e) {
+      pm.globals.set("ErrorFound", true);
+      throw e;
+    }
+  });
+}
+```
+
+### Pre-flight Variable Validation
+
+A collection-level pre-request script checks that all required variables are defined before any request executes. This catches configuration errors immediately rather than letting the run proceed with missing data and fail cryptically later.
+
+## Cleanup and Idempotency
+
+The final request in the collection deletes the issue created during the run, using admin credentials. If the Final Summary Report detects failures, it skips cleanup - preserving the test data for investigation. This pattern keeps the Jira instance clean on successful runs while supporting debugging on failures.
+
+## Running the Collection
+
+The collection uses configurable collection variables for all environment-specific values. To run against your own Jira Cloud instance:
+
+1. Set `baseURL`, `jiraEmail`, `jiraToken`, `adminEmail` and `adminToken` for authentication
+2. Set `projectKey` to your Jira project key (e.g. `SCRUM`)
+3. Set `boardName` and ensure it has at least one sprint
+4. Set `parentKey` to a valid epic, and `link1`, `link2`, `link3` to existing issue keys
+5. Run via Postman Collection Runner or Newman for CI integration
+
+The collection is designed to be fully self-contained - it creates its own test data, validates it thoroughly, and cleans up after itself.
