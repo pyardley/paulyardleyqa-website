@@ -1,6 +1,6 @@
 ---
 title: "Building a Sequential Event Query to Verify Database State Across Multiple Tables"
-description: "How I used SQL CTEs, LAG() window functions, and UNION ALL to build a single query that stitches together change history from multiple tables - making it easy to verify that a reporting table stays in sync with its source data."
+description: "How I used SQL CTEs, LAG() window functions and UNION ALL to build a single query that stitches together change history from multiple tables - making it easy to verify that a reporting table stays in sync with its source data."
 pubDate: 2026-03-25
 author: "Paul Yardley"
 tags:
@@ -15,9 +15,9 @@ readingTime: "7 min read"
 draft: false
 ---
 
-When you're testing a system where customer data flows through multiple tables - history logs, status checks, and a consolidated report - the hardest question isn't _"does the report look right?"_ It's _"can I prove it's right by tracing every change that led to this state?"_
+When you're testing a system where customer data flows through multiple tables - history logs, status checks and a consolidated report - the hardest question isn't _"does the report look right?"_ It's _"can I prove it's right by tracing every change that led to this state?"_
 
-In this post I'll walk through a real testing problem I solved with a single SQL query that combines data from five different tables into one chronological timeline of events.
+In this post I'll walk through a real testing problem I solved with a single SQL query that combines data from four different tables into one chronological timeline of events.
 
 ## The Scenario
 
@@ -31,39 +31,9 @@ Picture a customer management system with the following structure:
 
 The `CustomerReport` table is the one the business cares about. It combines the latest customer details with a derived status: the _lowest_ of the address and identity check statuses. So if the address check passed (3) but the identity check failed (2), the report status is 2 - Failed.
 
-A stored procedure, `sp_RefreshCustomerReport`, handles this logic. It's triggered automatically whenever:
-
-- A customer record is inserted or updated
-- An address check row is inserted
-- An identity check row is inserted
-
-```sql
--- Core logic from sp_RefreshCustomerReport
-SELECT @StatusA = ISNULL((
-    SELECT TOP 1 [Status]
-    FROM CustomerAddressCheck
-    WHERE CustomerID = @CustomerID
-    ORDER BY StatusDateTime DESC, CheckID DESC
-), 0);
-
-DECLARE @StatusI TINYINT = ISNULL((
-    SELECT TOP 1 [Status]
-    FROM CustomerIdentityCheck
-    WHERE CustomerID = @CustomerID
-    ORDER BY StatusDateTime DESC, CheckID DESC
-), 0);
-
-SET @StatusID = CASE
-    WHEN @StatusA < @StatusI THEN @StatusA
-    ELSE @StatusI
-END;
-```
-
-The procedure only inserts a new report row if something meaningful changed (address or status), which keeps the report table lean.
-
 ## The Testing Problem
 
-After setting up test data - inserting customers, progressing their checks through various statuses, updating an address - I ended up with data spread across five tables, each with its own timestamp column and its own idea of what "happened" to CustomerID 1.
+After setting up test data - inserting customers, progressing their checks through various statuses, updating an address - I ended up with data spread across four tables, each with its own timestamp column and its own idea of what "happened" to CustomerID 1.
 
 Here's what the raw data looks like after the test setup completes:
 
@@ -75,7 +45,7 @@ Looking at this, can you quickly tell me:
 - When the address changed from "12 High Street" to "12 High Road", did the report pick that up?
 - Is the final report status correct given the check statuses?
 
-You _can_ answer those questions by mentally cross-referencing five result sets and their timestamps. But that's slow, error-prone, and not something you'd want to do repeatedly across multiple customers or test runs.
+You _can_ answer those questions by mentally cross-referencing four result sets and their timestamps. But that's slow, error-prone, doesn't scale well and not something you'd want to do repeatedly across multiple customers or test runs.
 
 ## The Solution: A Sequential Event Query
 
@@ -163,7 +133,7 @@ SELECT * FROM Forn WHERE (CurrentValue != PreviousValue OR PreviousValue IS NULL
 UNION ALL
 SELECT * FROM Surn WHERE (CurrentValue != PreviousValue OR PreviousValue IS NULL)
 UNION ALL
-SELECT * FROM DOB WHERE (CurrentValue != PreviousValue OR PreviousValue IS NULL)
+SELECT * FROM Addr1 WHERE (CurrentValue != PreviousValue OR PreviousValue IS NULL)
 UNION ALL
 -- ... all other CTEs ...
 UNION ALL
@@ -181,24 +151,24 @@ Running this query produces a single timeline for CustomerID 1:
 
 Now you can read the story of what happened to this customer from top to bottom:
 
-1. **Row 1–4**: Customer inserted - all fields set for the first time in `CustomerHistory` (PreviousValue is NULL)
-2. **Row 5–8**: `CustomerReport` created with matching initial values and status 0 (Not all checks started)
-3. **Row 9**: Address check moves from "not started" to "Failed" (status 0 → 2)
-4. **Row 10**: Identity check moves from "not started" to "Passed" (status 0 → 3)
-5. **Row 11**: Report refreshes - status becomes 2 (Failed), because at least one of the status checks has failed
-6. **Row 12**: Customer address updated from "12 High Street" to "12 High Road" in `CustomerHistory`
-7. **Row 13**: `CustomerReport` picks up the address change
-8. **Row 14**: Address check now passes (status 2 → 3)
-9. **Row 21**: Report refreshes - status becomes 3 (Pass), because both address and identity checks have now passed
+1. **Row 1–3**: Customer inserted - all fields set for the first time in `CustomerHistory` (PreviousValue is NULL)
+2. **Row 4–6**: `CustomerReport` created with matching initial values and status 0 (Not all checks started)
+3. **Row 7**: Address check moves from "not started" to "Failed" (status 0 → 2)
+4. **Row 8**: Identity check moves from "not started" to "Passed" (status 0 → 3)
+5. **Row 9**: Report refreshes - status becomes 2 (Failed), because at least one of the status checks has failed
+6. **Row 10**: Customer address updated from "12 High Street" to "12 High Road" in `CustomerHistory`
+7. **Row 11**: `CustomerReport` picks up the address change
+8. **Row 12**: Address check now passes (status 2 → 3)
+9. **Row 13**: Report refreshes - status becomes 3 (Pass), because both address and identity checks have now passed
 
 Every step is traceable. Every report state is explainable.
 
 ## Why This Matters for Testing
 
-This query transforms what would be a tedious manual comparison of five separate result sets into a single, readable audit trail. It's useful for:
+This query transforms what would be a tedious manual comparison of four separate result sets into a single, readable audit trail. It's useful for:
 
 - **Verifying trigger behaviour** - have triggers fired correctly on every update?
-- **Validating report status logic** - have the most recent address and identity statuses been uused to calculate the report status?
+- **Validating report status logic** - have the most recent address and identity statuses been used to calculate the report status?
 - **Regression testing** - after schema changes, does the same sequence of operations produce the same timeline?
 - **Debugging failures** - when a report looks wrong, this query tells you exactly where the data diverged from expectations
 - **Presenting results** - easier to explain the sequence of events to stakeholders when trying to get sign-off.
