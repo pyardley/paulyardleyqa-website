@@ -16,10 +16,15 @@
         id="name"
         name="name"
         required
+        minlength="1"
+        maxlength="100"
+        pattern="^[a-zA-ZÀ-ÖØ-öø-ÿ' \-]+$"
+        title="Only letters, apostrophes, hyphens and accented characters are allowed"
         autocomplete="name"
         class="w-full px-4 py-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-teal focus:border-teal transition-colors"
         placeholder="Your name"
       />
+      <p id="name-error" class="text-red-500 text-sm mt-1 hidden"></p>
     </div>
     <div>
       <label for="email" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1">
@@ -30,10 +35,15 @@
         id="email"
         name="email"
         required
+        minlength="1"
+        maxlength="254"
+        pattern="^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+        title="Please enter a valid email address (e.g. you@example.com)"
         autocomplete="email"
         class="w-full px-4 py-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-teal focus:border-teal transition-colors"
         placeholder="you@example.com"
       />
+      <p id="email-error" class="text-red-500 text-sm mt-1 hidden"></p>
     </div>
   </div>
 
@@ -45,9 +55,15 @@
       type="text"
       id="subject"
       name="subject"
+      required
+      minlength="1"
+      maxlength="100"
+      pattern="^[a-zA-Z0-9À-ÖØ-öø-ÿ' \-]+$"
+      title="Only letters, numbers, apostrophes, hyphens and accented characters are allowed"
       class="w-full px-4 py-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-teal focus:border-teal transition-colors"
       placeholder="What's this about?"
     />
+    <p id="subject-error" class="text-red-500 text-sm mt-1 hidden"></p>
   </div>
 
   <div>
@@ -58,10 +74,13 @@
       id="message"
       name="message"
       required
+      minlength="1"
+      maxlength="500"
       rows="5"
       class="w-full px-4 py-2.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-teal focus:border-teal transition-colors resize-y"
       placeholder="Your message..."
     ></textarea>
+    <p id="message-error" class="text-red-500 text-sm mt-1 hidden"></p>
   </div>
 
   <!-- Honeypot for spam -->
@@ -79,3 +98,38 @@
     </svg>
   </button>
 </form>
+
+<script>
+  const alphaPattern = /^[a-zA-ZÀ-ÖØ-öø-ÿ' \-]+$/;
+  const errorMsg = 'Only letters, apostrophes, hyphens and accented characters are allowed';
+
+  function addValidation(inputId: string, errorId: string, pattern: RegExp, message: string) {
+    const input = document.getElementById(inputId) as HTMLInputElement | HTMLTextAreaElement;
+    const error = document.getElementById(errorId) as HTMLParagraphElement;
+    if (!input || !error) return;
+
+    input.addEventListener('input', () => {
+      const value = input.value;
+      if (value && !pattern.test(value)) {
+        error.textContent = message;
+        error.classList.remove('hidden');
+        input.setCustomValidity(message);
+      } else {
+        error.textContent = '';
+        error.classList.add('hidden');
+        input.setCustomValidity('');
+      }
+    });
+  }
+
+  addValidation('name', 'name-error', alphaPattern, errorMsg);
+  const subjectPattern = /^[a-zA-Z0-9À-ÖØ-öø-ÿ' \-]+$/;
+  const subjectErrorMsg = 'Only letters, numbers, apostrophes, hyphens and accented characters are allowed';
+  addValidation('subject', 'subject-error', subjectPattern, subjectErrorMsg);
+  const messagePattern = /^[a-zA-ZÀ-ÖØ-öø-ÿ0-9 ''\-.,;:!?@#£$%&*()_+=\/~"\r\n]+$/;
+  const messageErrorMsg = 'Your message contains characters that are not allowed. Please avoid using < > { } ` \\ | ^ [ ]';
+  addValidation('message', 'message-error', messagePattern, messageErrorMsg);
+
+  const emailPattern = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
+  addValidation('email', 'email-error', emailPattern, 'Please enter a valid email address (e.g. you@example.com)');
+</script>
