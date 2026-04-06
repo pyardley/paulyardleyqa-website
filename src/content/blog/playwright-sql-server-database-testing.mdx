@@ -1,0 +1,245 @@
+---
+title: "Connecting Playwright Tests to SQL Server: End-to-End Database Verification"
+description: "How I built a Playwright test project that connects directly to SQL Server using mssql and msnodesqlv8, enabling true end-to-end testing where UI actions are verified against the database - plus a look at alternative approaches."
+pubDate: "2026-04-06"
+author: "Paul Yardley"
+tags:
+  [
+    "Playwright",
+    "SQL Server",
+    "Database Testing",
+    "E2E Testing",
+    "Node.js",
+    "Test Automation",
+  ]
+readingTime: "9 min read"
+draft: false
+---
+
+Most end-to-end tests stop at the browser. You click a button, check the success message appears, and call it a day. But what if the success message renders fine while the database write silently fails? That gap between _"the UI said it worked"_ and _"the data is actually there"_ is where real bugs hide.
+
+In this post I'll walk through a project I built that bridges that gap — a Playwright test suite that connects directly to SQL Server using Windows Authentication, verifying that UI actions result in the correct database state.
+
+The full source code is available on GitHub: [Playwright_SQLserver](https://github.com/pyardley/Playwright_SQLserver).
+
+## The Architecture
+
+The project has three moving parts:
+
+1. **An Express web application** (`src/app.ts`) — a simple comment form that writes to SQL Server
+2. **A database utility module** (`src/db.ts`) — a reusable connection pool and query layer
+3. **Playwright test specs** — tests that interact with the UI _and_ query the database directly
+
+Playwright's built-in `webServer` configuration automatically starts the Express app before tests run, so there's no manual server management:
+
+```typescript
+// playwright.config.ts
+export default defineConfig({
+  testDir: "./tests",
+  use: {
+    baseURL: process.env.BASE_URL || "http://localhost:3000",
+  },
+  webServer: {
+    command: "npx ts-node src/app.ts",
+    url: "http://localhost:3000",
+    reuseExistingServer: !process.env.CI,
+    timeout: 30000,
+  },
+});
+```
+
+This means running `npx playwright test` handles everything — spinning up the server, executing tests across Chromium, Firefox and WebKit, then tearing it all down.
+
+## Connecting to SQL Server from Node.js
+
+The database connection is the heart of this project. The `src/db.ts` module uses two npm packages working together:
+
+- **`mssql`** — the most popular SQL Server client for Node.js, providing connection pooling, parameterized queries and TypeScript support
+- **`msnodesqlv8`** — a native ODBC driver that enables Windows Authentication (Trusted Connection) without needing a username and password
+
+The connection uses an ODBC connection string rather than the typical host/port/user/password configuration:
+
+```typescript
+import sql from "mssql/msnodesqlv8";
+
+const config: any = {
+  connectionString: `Driver={ODBC Driver 18 for SQL Server};Server=${server};Database=${database};Trusted_Connection=Yes;TrustServerCertificate=Yes;`,
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000,
+  },
+};
+```
+
+Key details here:
+
+- **`mssql/msnodesqlv8`** — importing from this sub-path tells the `mssql` library to use the native ODBC driver instead of the default `tedious` (pure JavaScript) driver
+- **`Trusted_Connection=Yes`** — uses the Windows identity of the process running Node.js, so no credentials are stored in code or environment variables
+- **`TrustServerCertificate=Yes`** — needed for local development instances where the SQL Server certificate isn't signed by a trusted CA
+- **Connection pooling** — the pool is created once and reused across all tests, avoiding the overhead of connecting per query
+
+The module exposes three functions:
+
+```typescript
+// Execute a SELECT and return typed results
+export async function query<T>(
+  queryText: string,
+  params: any[] = [],
+): Promise<T[]>;
+
+// Execute INSERT/UPDATE/DELETE and return rows affected
+export async function execute(
+  commandText: string,
+  params: any[] = [],
+): Promise<number>;
+
+// Close the pool (call in afterAll)
+export async function closePool(): Promise<void>;
+```
+
+Both `query()` and `execute()` use parameterized queries with positional placeholders (`@param0`, `@param1`, etc.) to prevent SQL injection — critical even in test code, since it establishes good habits and avoids issues with special characters in test data.
+
+## The Tests: UI + Database Verification
+
+### Basic connectivity tests
+
+The `example-db.spec.ts` file starts with pure database tests that don't need a browser at all:
+
+```typescript
+test("should connect to SQL Server and run a simple query", async () => {
+  const result = await query<{ value: number }>("SELECT 1 AS value");
+  expect(result).toHaveLength(1);
+  expect(result[0].value).toBe(1);
+});
+
+test("should retrieve server version info", async () => {
+  const result = await query<{ version: string }>(
+    "SELECT @@VERSION AS version",
+  );
+  expect(result[0].version).toContain("Microsoft SQL Server");
+});
+```
+
+These are useful as smoke tests — if the database connection is misconfigured, these fail fast with a clear error rather than leaving you debugging a cryptic UI test failure.
+
+### The full end-to-end test
+
+The `comment-save.spec.ts` file is where things get interesting. It tests the complete flow: submit a comment through the web form, verify the success message, then _query the database directly_ to confirm the data was actually persisted:
+
+```typescript
+test("should save a comment via the web app and verify it in the database", async ({
+  page,
+}) => {
+  // Generate a unique comment using crypto.randomUUID()
+  const randomComment = `Test comment ${crypto.randomUUID()}`;
+
+  // Step 1: Navigate to the comment form
+  await page.goto("/");
+  await expect(page.locator("h1")).toHaveText("Add a Comment");
+
+  // Step 2: Fill in and submit the form
+  await page.fill("#comment", randomComment);
+  await page.click("#saveButton");
+
+  // Step 3: Verify the UI shows success
+  await expect(page.locator("#result")).toHaveText(
+    "Comment saved successfully!",
+  );
+
+  // Step 4: Verify the comment exists in the database
+  const results = await query<{ comment: string }>(
+    "SELECT comment FROM Comments WHERE comment = @param0",
+    [randomComment],
+  );
+  expect(results).toHaveLength(1);
+  expect(results[0].comment).toBe(randomComment);
+
+  // Step 5: Clean up test data
+  await execute("DELETE FROM Comments WHERE comment = @param0", [
+    randomComment,
+  ]);
+});
+```
+
+A few design decisions worth highlighting:
+
+- **Unique test data** — `crypto.randomUUID()` ensures each test run produces a unique comment, so tests never collide with each other or with leftover data from previous runs
+- **Database assertion** — after the UI confirms success, we query SQL Server directly to prove the INSERT actually happened. This catches bugs where the endpoint returns 200 but the database transaction rolled back
+- **Cleanup after test** — the test deletes its own data, keeping the database clean for the next run. This is essential for repeatable tests
+
+### Connection lifecycle
+
+Both test files close the connection pool in `afterAll`:
+
+```typescript
+test.afterAll(async () => {
+  await closePool();
+});
+```
+
+This prevents connection leaks and ensures the Node.js process exits cleanly after tests complete.
+
+## Environment Configuration
+
+The project uses `dotenv` to load connection details from a `.env` file:
+
+```env
+DB_SERVER=localhost\MSSQLSERVERNAME
+DB_DATABASE=MyDatabase
+DB_ODBC_DRIVER=ODBC Driver 18 for SQL Server
+BASE_URL=http://localhost:3000
+```
+
+This keeps environment-specific values out of the code. A `.env.example` file is committed to the repository as a template, while `.env` itself is gitignored.
+
+## Alternative Technologies and Approaches
+
+This project makes specific technology choices that are well-suited to a Windows/SQL Server environment, but there are several alternative approaches worth considering.
+
+### Alternative database drivers
+
+**`tedious` (pure JavaScript driver)** — The default driver used by the `mssql` package when you import `mssql` directly instead of `mssql/msnodesqlv8`. It doesn't require ODBC drivers to be installed and works on Linux and macOS out of the box. The trade-off is that it doesn't support Windows Authentication natively — you'll need SQL Server authentication (username/password) or Azure Active Directory tokens instead. For CI/CD pipelines running on Linux containers, `tedious` is usually the better choice.
+
+**`knex.js` or `TypeORM`** — If your tests need to work across different databases (e.g., SQL Server in production, SQLite for local testing), an ORM or query builder provides a database-agnostic abstraction layer. This adds complexity but can be valuable for projects that need to support multiple database backends.
+
+**`prisma`** — An increasingly popular ORM that generates a type-safe client from your database schema. It supports SQL Server and would give you stronger type safety than the manual `query<T>()` approach used here. However, it requires maintaining a schema file and running migrations, which adds overhead for a test-focused project.
+
+### Alternative test frameworks
+
+**Cypress with `cy.task()`** — Cypress supports database operations through its task system, where you define Node.js functions in `cypress.config.js` that run outside the browser. The `cypress-sql-server` plugin provides a similar capability. Compared to Playwright's approach of importing modules directly into test files, Cypress requires a more indirect pattern via `cy.task('queryDb', sql)`.
+
+**WebdriverIO with custom services** — WebdriverIO's service architecture lets you create a database service that initializes connections in `onPrepare` and provides helper methods throughout the test lifecycle. There's more boilerplate involved compared to Playwright's direct import approach, but it can work well if you're already invested in the WebdriverIO ecosystem.
+
+**Robot Framework with DatabaseLibrary** — For teams that prefer keyword-driven testing, Robot Framework's DatabaseLibrary supports SQL Server and provides keywords like `Query`, `Execute SQL String`, and `Check If Exists In Database`. This is a good option if your team includes non-developers who need to write or understand tests.
+
+### Alternative patterns for database verification
+
+**API-layer verification instead of direct DB access** — Rather than querying the database directly from tests, you could verify data through an API endpoint (e.g., `GET /api/comments?text=...`). This tests the full stack without coupling your tests to the database schema, but it means you're testing two things at once and a bug in the read endpoint could mask a write bug.
+
+**Database snapshots and comparison** — Tools like `tSQLt` (a SQL Server unit testing framework) or custom snapshot logic can capture database state before and after an operation, then compare the differences. This is more thorough but slower and harder to maintain.
+
+**Event-driven verification** — In event-sourced systems, you could verify that the correct domain events were published rather than checking database state directly. This decouples tests from the storage implementation but requires an event infrastructure.
+
+**Docker-based test databases** — Running SQL Server in a Docker container (`mcr.microsoft.com/mssql/server`) provides a clean, disposable database for each test run. This eliminates data cleanup concerns entirely but requires Docker and adds startup time. It also means switching from Windows Authentication to SQL Authentication, since the Linux-based SQL Server container doesn't support Windows Auth.
+
+### When to use this approach
+
+Direct database verification from Playwright tests is most valuable when:
+
+- You need to prove that UI actions result in correct data persistence
+- The application under test doesn't have comprehensive API endpoints for reading data back
+- You're testing data integrity requirements (e.g., financial transactions, audit trails)
+- Your team owns both the test code and the database, so schema coupling is acceptable
+
+It's less appropriate when:
+
+- The database schema changes frequently and test maintenance becomes a burden
+- Tests run against shared environments where direct database access introduces flakiness
+- The application has a well-tested API layer that already validates data persistence
+
+## Wrapping Up
+
+This project demonstrates a practical pattern for extending Playwright beyond pure UI testing. By combining browser automation with direct database access, you can build tests that verify the complete data flow — from user input in the browser, through the application layer, all the way to the rows in SQL Server.
+
+The key ingredients are straightforward: the `mssql` and `msnodesqlv8` packages for database connectivity, parameterized queries for safety, connection pooling for performance, and unique test data generation for reliability. Whether you adopt this exact stack or one of the alternatives discussed above, the principle remains the same: **don't just test what the user sees — verify what the system actually did**.

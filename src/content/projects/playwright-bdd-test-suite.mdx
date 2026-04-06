@@ -1,0 +1,224 @@
+---
+title: "BDD End-to-End Testing with Playwright: Gherkin Features Meet Modern Browser Automation"
+description: "A behaviour-driven test suite for a live website built with playwright-bdd, combining Gherkin feature files with Playwright's cross-browser engine. Covers navigation, form validation, file downloads, mobile responsiveness and theme detection across 7 browser targets."
+industry: "Software / Web Development"
+role: "QA Engineer"
+duration: "Personal project"
+tools:
+  ["Playwright", "playwright-bdd", "TypeScript", "Gherkin", "GitHub Actions"]
+scope:
+  [
+    "BDD Test Automation",
+    "Cross-Browser Testing",
+    "Form Validation",
+    "Mobile Responsive Testing",
+    "CI/CD",
+  ]
+order: 2
+results:
+  - metric: "Feature Files"
+    value: "9 (home, header, footer, contact, resume, blog, portfolio, about, skills)"
+  - metric: "Browser Targets"
+    value: "7 (Chromium, Firefox, WebKit, Edge, Chrome, Pixel 5, iPhone 12)"
+  - metric: "Scenarios"
+    value: "58 across smoke and regression suites"
+---
+
+Most Playwright projects start with standard `test()` blocks and never look back. This project takes a different path - wrapping Playwright's browser automation engine in **Gherkin feature files** using the [playwright-bdd](https://github.com/vitalets/playwright-bdd) library. The result is a test suite where every scenario reads as a plain-English specification, while the underlying execution still benefits from Playwright's auto-retrying assertions, parallel workers and cross-browser coverage.
+
+The full suite is available on GitHub: [github.com/pyardley/playwright-bdd-suite](https://github.com/pyardley/playwright-bdd-suite)
+
+## What the Suite Tests
+
+The suite targets [paulyardley.com](https://paulyardley.com) - a live Astro-based portfolio site - and covers nine feature areas:
+
+### Navigation and Link Integrity
+
+The **header**, **footer** and **home page** features use `Scenario Outline` with `Examples` tables to verify every navigation link points to the correct URL. The header step definitions detect the `isMobile` fixture and automatically open the hamburger menu on mobile viewports before asserting link targets.
+
+A typical feature file looks like this, with a `Background` block for shared setup and an `Examples` table driving multiple scenarios from a single outline:
+
+```gherkin
+@smoke @header
+Feature: Header Link Checking
+  As a visitor to the website
+  I want the header navigation links to point to the correct pages
+  So that I can navigate the site using the main menu
+
+  Background:
+    Given the user is on the "contact" page
+
+  Scenario Outline: Header links are correct
+    Then the Header "<linkName>" link points to "<linkAddress>"
+
+    Examples:
+      | linkName           | linkAddress        |
+      | Home               | /                  |
+      | About              | /about             |
+      | Skills             | /skills            |
+      | Portfolio          | /portfolio         |
+      | Blog               | /blog              |
+      | Resume             | /resume            |
+      | Contact            | /contact           |
+      | Paul Yardley       | /                  |
+```
+
+The step definition behind this adapts its behaviour depending on whether the test is running on a desktop or mobile browser project:
+
+```typescript
+Then(
+  "the Header {string} link points to {string}",
+  async ({ page, isMobile }, linkName: string, expectedUrl: string) => {
+    if (isMobile && linkName !== "Paul Yardley") {
+      await page.locator("#mobile-menu-btn").click();
+      const mobileMenu = page.locator("#mobile-menu");
+      await expect(mobileMenu).toBeVisible();
+      const menuItem = mobileMenu.getByRole("link", { name: linkName });
+      await expect(menuItem).toHaveAttribute("href", expectedUrl);
+    } else {
+      const header = page.locator("header");
+      await expect(
+        header.getByRole("link", { name: linkName }),
+      ).toHaveAttribute("href", expectedUrl);
+    }
+  },
+);
+```
+
+### Contact Form Validation
+
+The most data-intensive feature is the **contact page**, which uses `Scenario Outline` with `Examples` tables to exercise every validation rule across four form fields (name, email, subject, message). Test data includes empty fields, numeric input, XSS injection attempts, special characters, and internationalised names (François, L'Hôtel-résumé).
+
+A key design decision here is the **`fieldContext` custom fixture** - a per-test container that stores the current field's input and error locators. This avoids module-level mutable state that would cause race conditions when Playwright runs scenarios in parallel:
+
+```typescript
+export const test = base.extend({
+  fieldContext: async ({}, use) => {
+    await use({ value: null });
+  },
+  lastDownload: async ({}, use) => {
+    await use({ value: null });
+  },
+});
+```
+
+The error assertion step handles both **browser native validation messages** (extracted via `el.validationMessage`) and **application-level custom errors** (read from `#field-error` elements), using regex matching to accommodate cross-browser differences in native validation wording (e.g. "fill in" vs "fill out").
+
+### File Download Verification
+
+The **resume** feature captures Playwright's `download` event, then asserts the suggested filename and file path. The download object is passed between steps via the `lastDownload` fixture:
+
+```gherkin
+@smoke @resume
+Feature: User Resume page
+  As a visitor to the website
+  I want to download the resume as a PDF
+  So that I can review it offline
+
+  Scenario: Download the resume successfully
+    Given the user is on the "resume" page
+    When the user clicks the "Download PDF" link
+    Then the resume file should be downloaded successfully
+```
+
+### Content Link Verification
+
+The **blog** and **portfolio** features iterate through every article card on the page, clicking each link, asserting the resulting URL matches the expected `href`, and navigating back - a pattern that automatically covers new content as it's published without updating the test data.
+
+### Theme and Page Load Checks
+
+Simpler features verify the **about** and **skills** pages load with the correct heading, and a `@theme`-tagged scenario confirms the site defaults to light mode by clearing `localStorage` and checking the `html` element's class list.
+
+## How It All Fits Together
+
+The architecture follows a clean three-layer structure:
+
+1. **Feature files** (`features/*.feature`) - Gherkin specifications tagged with `@smoke` or `@regression` for selective execution
+2. **Step definitions** (`steps/*.steps.ts`) - TypeScript implementations that map Gherkin steps to Playwright actions, importing `Given`, `When`, `Then` from a centralised fixtures module
+3. **Auto-generated specs** (`.features-gen/`) - The `npx bddgen` command reads features and steps, then generates standard Playwright spec files that the test runner executes
+
+The `playwright.config.ts` wires BDD generation into the test directory:
+
+```typescript
+const testDir = defineBddConfig({
+  features: "features/**/*.feature",
+  steps: "steps/**/*.ts",
+});
+```
+
+Tests run across **7 browser projects** - Chromium, Firefox, WebKit, Microsoft Edge, Google Chrome, Mobile Chrome (Pixel 5) and Mobile Safari (iPhone 12) - with `fullyParallel: true` for concurrent execution.
+
+## BDD vs Standard Playwright Tests: When to Use Each
+
+This project deliberately chose BDD over standard Playwright `test()` blocks. That choice isn't always the right one, so it's worth examining when each approach makes sense.
+
+### When BDD Adds Value
+
+**Stakeholder communication** is the primary reason to use BDD. When product owners, business analysts or non-technical team members need to read, review or contribute to test specifications, Gherkin's Given/When/Then syntax acts as living documentation that both humans and machines can parse. The "As a... I want... So that..." user story format on each feature file makes the intent explicit.
+
+**Data-driven validation** is another strength. The contact form feature in this suite uses `Scenario Outline` with `Examples` tables to express 25+ input combinations in a format that's easy to scan and extend. Adding a new edge case means adding a row to a table, not writing a new test function.
+
+**Step reuse across features** works naturally in BDD. The "Given the user is on the page" step is defined once and shared across all nine features. In standard Playwright, you'd either duplicate the navigation call or create a helper function - which works, but BDD formalises the reuse.
+
+### When Standard Playwright Tests Are Better
+
+**Low-level technical assertions** - checking network responses, intercepting API calls, validating complex DOM state - are awkward in Gherkin. The natural language layer adds indirection without adding clarity when the audience is developers who are comfortable reading TypeScript directly.
+
+**Rapid prototyping and debugging** favours standard tests. With plain `test()` blocks you get immediate feedback, no code generation step (`npx bddgen`), and direct access to Playwright's full API without mapping through step definitions.
+
+**Small teams of developers** where everyone reads code fluently often find BDD's ceremony - maintaining separate feature files, step definitions, and the mapping between them - to be overhead without proportionate benefit. The same test logic in a standard Playwright spec is more compact:
+
+```typescript
+// Standard Playwright - compact, direct
+test("header links are correct", async ({ page }) => {
+  await page.goto("/contact");
+  const header = page.locator("header");
+  await expect(header.getByRole("link", { name: "Home" })).toHaveAttribute(
+    "href",
+    "/",
+  );
+  await expect(header.getByRole("link", { name: "About" })).toHaveAttribute(
+    "href",
+    "/about",
+  );
+});
+```
+
+```gherkin
+# BDD equivalent - more verbose, but readable by non-developers
+Scenario Outline: Header links are correct
+  Then the Header "<linkName>" link points to "<linkAddress>"
+  Examples:
+    | linkName | linkAddress |
+    | Home     | /           |
+    | About    | /about      |
+```
+
+**Performance-sensitive pipelines** may also favour standard tests. The BDD generation step adds a few seconds to each run, and the generated spec files are an intermediate artefact that needs to stay in sync with feature files.
+
+### The Decision Framework
+
+| Factor                           | Favour BDD | Favour Standard Playwright |
+| -------------------------------- | ---------- | -------------------------- |
+| Audience includes non-developers | Yes        | No                         |
+| Heavy data-driven testing        | Yes        | Neutral                    |
+| Step reuse across many features  | Yes        | Neutral                    |
+| Complex DOM/network assertions   | No         | Yes                        |
+| Small developer-only team        | No         | Yes                        |
+| CI pipeline speed is critical    | No         | Yes                        |
+| Living documentation requirement | Yes        | No                         |
+
+## Alternative Technologies
+
+Beyond the BDD-vs-standard decision, several other tools occupy this space:
+
+- **Cypress with cypress-cucumber-preprocessor** - The closest alternative stack. Cypress has excellent developer experience and time-travel debugging, but lacks native multi-browser support (WebKit/Safari is experimental) and runs in-process rather than using the CDP/WebSocket protocol, which limits certain testing patterns.
+- **WebdriverIO with Cucumber** - The traditional BDD-in-browser choice. Supports Selenium Grid for distributed execution but has slower execution than Playwright and more complex setup.
+- **CodeceptJS** - A higher-level wrapper that supports BDD syntax with multiple backends (Playwright, WebDriver, Puppeteer). Useful if you want to abstract the browser engine, but adds another dependency layer.
+- **TestCafe** - No WebDriver dependency, built-in cross-browser support, but no native Gherkin/BDD integration without third-party plugins.
+
+Playwright-bdd was chosen here because it combines Playwright's speed, reliability and multi-browser coverage with Gherkin's readability - without requiring a separate test runner like Cucumber.js. The auto-generation approach means the Playwright test runner handles everything: parallel execution, retries, tracing and HTML reporting all work exactly as they would with standard specs.
+
+## CI/CD Integration
+
+A GitHub Actions workflow runs the full suite on every push and pull request to `main`. The pipeline installs dependencies, runs `npx bddgen` to generate specs from features, executes all tests with a single worker for CI stability, and uploads the Playwright HTML report as a build artefact retained for 30 days.
