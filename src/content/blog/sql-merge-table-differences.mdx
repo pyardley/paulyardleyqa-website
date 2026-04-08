@@ -1,0 +1,206 @@
+---
+title: "Using SQL MERGE to Detect Inserts, Updates and Deletes Between Two Tables"
+description: "A single-pass SQL pattern using MERGE with OUTPUT to compare two tables and classify every difference as an insert, update or delete - with AI generating the query directly from the database schema."
+pubDate: 2026-04-08
+author: "Paul Yardley"
+tags:
+  [
+    "SQL",
+    "Database Testing",
+    "Data Verification",
+    "QA Engineering",
+    "AI",
+    "MERGE",
+  ]
+readingTime: "6 min read"
+draft: false
+---
+
+In a [previous post](/blog/sql-except-table-differences), I walked through a pattern using `EXCEPT` and CTEs to compare two tables and produce a change report. That approach works well and is easy to understand - but it requires two separate scans of both tables and additional joins to classify the results. In this post I'll show how SQL Server's `MERGE` statement can do the same job in a **single pass**, and how I used an AI coding agent to generate the query automatically by connecting to the database and reading the schema.
+
+## How the Query Was Generated
+
+Rather than writing the `MERGE` statement by hand, I used an AI coding assistant (Claude) connected to the SQL Server instance via `sqlcmd`. The workflow went like this:
+
+1. **Connect to the database** - the AI ran `sqlcmd` with Windows Authentication to verify connectivity to the `CustomerDemo` database
+2. **Pull back the schema** - it queried `INFORMATION_SCHEMA.COLUMNS` for both `Customer` and `CustomerOriginal` to discover the column names and data types automatically
+3. **Generate the MERGE** - using the schema information, it built the complete `MERGE` statement with the correct column lists, `ISNULL` handling for nullable columns, and `IDENTITY_INSERT` management
+4. **Iterate on errors** - the first attempt hit an identity column constraint and a `NOT NULL` violation on `UpdatedDateTime`. The AI read the error messages and corrected the query in subsequent attempts without any manual intervention
+
+This is a practical example of AI-assisted SQL development: the agent doesn't need to be told the column names or data types - it discovers them from the database metadata and adapts when things go wrong.
+
+## The Scenario
+
+The setup is the same as the previous post. Two tables - `CustomerOriginal` (the baseline) and `Customer` (the current state) - share an identical schema:
+
+| Column | Type |
+|--------|------|
+| CustomerID | int (identity, PK) |
+| Forename | nvarchar |
+| Surname | nvarchar |
+| UpdatedDateTime | datetime2 |
+| AddressLine1 | nvarchar |
+| AddressLine2 | nvarchar |
+
+The current `Customer` table has three differences from the original: a deleted row, a modified row and a new row.
+
+## The MERGE Query
+
+```sql
+BEGIN TRAN;
+SET IDENTITY_INSERT CustomerOriginal ON;
+
+MERGE CustomerOriginal AS target
+USING Customer AS source
+ON target.CustomerID = source.CustomerID
+
+WHEN MATCHED AND (
+    ISNULL(target.Forename, '') != ISNULL(source.Forename, '')
+    OR ISNULL(target.Surname, '') != ISNULL(source.Surname, '')
+    OR ISNULL(target.AddressLine1, '') != ISNULL(source.AddressLine1, '')
+    OR ISNULL(target.AddressLine2, '') != ISNULL(source.AddressLine2, ''))
+  THEN UPDATE SET target.Forename = target.Forename
+
+WHEN NOT MATCHED BY TARGET
+  THEN INSERT (CustomerID, Forename, Surname, UpdatedDateTime,
+               AddressLine1, AddressLine2)
+       VALUES (source.CustomerID, source.Forename, source.Surname,
+               source.UpdatedDateTime, source.AddressLine1,
+               source.AddressLine2)
+
+WHEN NOT MATCHED BY SOURCE
+  THEN DELETE
+
+OUTPUT
+  $action AS ChangeType,
+  ISNULL(inserted.CustomerID, deleted.CustomerID) AS CustomerID,
+  deleted.Forename   AS Old_Forename,
+  inserted.Forename  AS New_Forename,
+  deleted.Surname    AS Old_Surname,
+  inserted.Surname   AS New_Surname,
+  deleted.AddressLine1  AS Old_Addr1,
+  inserted.AddressLine1 AS New_Addr1,
+  deleted.AddressLine2  AS Old_Addr2,
+  inserted.AddressLine2 AS New_Addr2;
+
+SET IDENTITY_INSERT CustomerOriginal OFF;
+ROLLBACK TRAN;
+```
+
+And this is the output it produces:
+
+| ChangeType | CustomerID | Old_Forename | New_Forename | Old_Surname | New_Surname | Old_Addr1 | New_Addr1 | Old_Addr2 | New_Addr2 |
+|------------|-----------|--------------|--------------|-------------|-------------|-----------|-----------|-----------|-----------|
+| DELETE | 1 | John | NULL | Doe | NULL | 123 London Road | NULL | Apt 4B | NULL |
+| UPDATE | 2 | Jane | Jane | Smith | Smith-London | 45 High Street | 45 High Street | NULL | Top Floor Flat |
+| INSERT | 5 | NULL | Robert | NULL | Tables | NULL | 10 Downing Street | NULL | SW1A 2AA |
+
+Three rows, one per change - with the change type and old/new values side by side. Let's break down how this works.
+
+## How It Works
+
+### The MERGE Join
+
+```sql
+MERGE CustomerOriginal AS target
+USING Customer AS source
+ON target.CustomerID = source.CustomerID
+```
+
+`MERGE` performs a single join between the two tables on the primary key. From this one join, it can identify three categories of rows: matched (exist in both), not matched by target (new in source), and not matched by source (missing from source). This is the key efficiency gain - one pass instead of two.
+
+### Detecting Updates
+
+```sql
+WHEN MATCHED AND (
+    ISNULL(target.Forename, '') != ISNULL(source.Forename, '')
+    OR ISNULL(target.Surname, '') != ISNULL(source.Surname, '')
+    OR ISNULL(target.AddressLine1, '') != ISNULL(source.AddressLine1, '')
+    OR ISNULL(target.AddressLine2, '') != ISNULL(source.AddressLine2, ''))
+  THEN UPDATE SET target.Forename = target.Forename
+```
+
+When a `CustomerID` exists in both tables, the `WHEN MATCHED` clause fires. The additional `AND` condition checks whether any column actually differs (using `ISNULL` to handle `NULL` comparisons safely). The `UPDATE SET target.Forename = target.Forename` is a deliberate no-op - we don't want to change data, we just need `MERGE` to register the action so the `OUTPUT` clause can capture it.
+
+In our example, CustomerID 2 (Jane Smith) matches on the key but has a different surname and address, so it triggers the UPDATE path.
+
+### Detecting Inserts
+
+```sql
+WHEN NOT MATCHED BY TARGET
+  THEN INSERT (CustomerID, Forename, Surname, UpdatedDateTime,
+               AddressLine1, AddressLine2)
+       VALUES (source.CustomerID, source.Forename, ...)
+```
+
+Rows in `Customer` (source) with no matching `CustomerID` in `CustomerOriginal` (target) are new inserts. CustomerID 5 (Robert Tables) only exists in `Customer`, so it appears as an INSERT.
+
+### Detecting Deletes
+
+```sql
+WHEN NOT MATCHED BY SOURCE
+  THEN DELETE
+```
+
+Rows in `CustomerOriginal` (target) with no matching `CustomerID` in `Customer` (source) have been deleted. CustomerID 1 (John Doe) only exists in `CustomerOriginal`, so it's flagged as a DELETE.
+
+### The OUTPUT Clause
+
+```sql
+OUTPUT
+  $action AS ChangeType,
+  ISNULL(inserted.CustomerID, deleted.CustomerID) AS CustomerID,
+  deleted.Forename   AS Old_Forename,
+  inserted.Forename  AS New_Forename,
+  ...
+```
+
+The `OUTPUT` clause is what makes this work as a comparison tool. `$action` is a special `MERGE` variable that returns `'INSERT'`, `'UPDATE'` or `'DELETE'` depending on which branch was taken. The `inserted` and `deleted` pseudo-tables give access to the new and old values respectively - for updates you get both, for inserts only `inserted` is populated, and for deletes only `deleted`.
+
+### The ROLLBACK
+
+```sql
+BEGIN TRAN;
+...
+ROLLBACK TRAN;
+```
+
+The entire `MERGE` is wrapped in a transaction that is immediately rolled back. This means **no data is modified** - we get the full `OUTPUT` result set showing all differences, but both tables remain untouched. This is what turns `MERGE` from a data synchronisation tool into a pure comparison tool.
+
+## Comparing MERGE with EXCEPT
+
+In the [previous post](/blog/sql-except-table-differences), the `EXCEPT` approach used two CTEs and four `UNION ALL` branches with joins to classify changes. Here's how the two approaches compare:
+
+| Aspect | EXCEPT + CTEs | MERGE + OUTPUT |
+|--------|--------------|----------------|
+| **Table scans** | Two full scans per CTE (four total) | Single join |
+| **Change classification** | Manual via joins and NULL checks | Automatic via `$action` |
+| **Old and new values** | Separate rows (CHANGED FROM / CHANGED TO) | Side-by-side columns in one row |
+| **Column enumeration** | None needed (`SELECT *`) | Required for `ISNULL` checks and INSERT |
+| **NULL handling** | Automatic (EXCEPT treats NULLs as equal) | Manual (`ISNULL` wrappers needed) |
+| **Readability** | More intuitive for SQL beginners | More compact but requires MERGE knowledge |
+| **Schema changes** | No query changes needed | Must update column lists |
+
+The `EXCEPT` approach wins on simplicity and schema independence - you don't need to name columns at all. The `MERGE` approach wins on efficiency and output format - one pass, one row per change, old and new values side by side.
+
+For **small to medium tables**, either approach works well. For **large tables** or scenarios where you need the old and new values in the same row (common in test assertions), `MERGE` is the better choice.
+
+## The AI Advantage
+
+What struck me about the AI-assisted workflow was how it handled the iterative debugging. The first `MERGE` attempt failed because `CustomerOriginal` has an identity column - the AI read the error, added `SET IDENTITY_INSERT ON` and retried. The second attempt failed because `UpdatedDateTime` was `NOT NULL` and was missing from the `INSERT` clause - again, it read the error and fixed it.
+
+This is exactly the kind of tedious back-and-forth that slows down manual SQL development. The AI agent turned three iterations into about 30 seconds of elapsed time, and it did it by reading the same error messages a human would read - just faster.
+
+The schema discovery step is also worth highlighting. Rather than being told the column names, the agent queried `INFORMATION_SCHEMA.COLUMNS` and built the `ISNULL` comparisons and `INSERT` column list dynamically. If the table schema changes, running the same AI workflow would produce an updated query automatically.
+
+## Considerations
+
+- **MERGE requires column enumeration** - unlike `EXCEPT`, you need to list columns explicitly in the `MATCHED` condition and `INSERT` clause. This means the query needs updating when columns are added or removed.
+- **ISNULL sentinel values** - the `ISNULL(col, '')` pattern works for string columns but may need different sentinel values for numeric or date columns (e.g., `ISNULL(col, 0)` or `ISNULL(col, '1900-01-01')`).
+- **Identity columns** - if the target table has an identity column, you need `SET IDENTITY_INSERT ON` inside the transaction for the `INSERT` path to work.
+- **The no-op UPDATE trick** - `UPDATE SET target.col = target.col` is intentionally a no-op. It exists only to trigger the `OUTPUT` clause. This is a well-known pattern but can confuse readers unfamiliar with it.
+- **ROLLBACK is essential** - without the `ROLLBACK`, the `MERGE` would actually modify the target table. Always wrap comparison-only usage in a transaction.
+
+## Summary
+
+SQL Server's `MERGE` statement, combined with `OUTPUT` and a `ROLLBACK`, provides a single-pass method for detecting all inserts, updates and deletes between two tables. It produces a compact result set with old and new values side by side, making it particularly useful for test assertions and data auditing. While it requires more explicit column handling than the `EXCEPT` approach, it's more efficient on large tables and produces more directly usable output. And with an AI agent that can read the schema and iterate on errors, the query practically writes itself.
