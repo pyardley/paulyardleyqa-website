@@ -1,0 +1,174 @@
+---
+title: "Alternatives to Running LLMs Locally: Ollama Cloud, LM Studio on a Spare Machine and More"
+description: "A practical guide to running powerful LLMs without melting your daily driver — covering Ollama Cloud, LM Studio remote sharing via LM Link, and other strong alternatives for use with Roo Code and similar AI coding agents."
+pubDate: 2026-04-09
+author: "Paul Yardley"
+tags: ["LLM", "Ollama", "LM Studio", "Roo Code", "AI", "Local LLM", "VS Code"]
+readingTime: "8 min read"
+draft: false
+---
+
+If you're like many developers in 2026, you want access to powerful LLMs — especially for coding agents like **Roo Code** — without turning your daily driver into a space heater or maxing out your RAM. Local inference is fantastic for privacy and zero-cost heavy use, but not everyone has a high-end GPU rig handy.
+
+The good news? There are excellent middle-ground solutions that let you run massive models (30B+ parameters) while keeping your workflow in familiar tools. Below I've covered **Ollama Cloud** and **LM Studio remote sharing**, added practical tips, pros/cons, pricing context, and a couple of other strong alternatives.
+
+## Why Bother with Alternatives?
+
+Running LLMs locally demands serious hardware (especially for 30B+ models with long context). Electricity bills climb, fans scream, and your main machine slows to a crawl when you have 100+ browser tabs open. Cloud-offloaded or networked solutions give you the best of both worlds: big models + seamless integration with editors like **Roo Code** (the open-source AI dev team that lives inside VS Code and supports any OpenAI-compatible backend).
+
+## 1. Ollama Cloud: Run Giant Models with Zero Local Hardware
+
+### What it is
+
+Ollama Cloud (launched in preview September 2025) automatically offloads supported models to Ollama's datacenter-grade GPUs while keeping the exact same CLI, API, and tool experience you already love. Models are tagged `:cloud` and behave identically to local ones — no new commands to learn. Your prompts stay private: Ollama processes them but does not store, log, or train on your data.
+
+### Setup (step-by-step)
+
+**Download and install Ollama:**
+
+```powershell
+irm https://ollama.com/install.ps1 | iex
+```
+
+**Sign in** (Google or GitHub works):
+
+```bash
+ollama login
+```
+
+(Or just open the desktop app — it prompts you.)
+
+**Browse cloud-only models:**
+
+Go to [https://ollama.com/search?c=cloud](https://ollama.com/search?c=cloud) and copy any model ending in `:cloud` (e.g., `gemma4:31b-cloud`, `glm-4.7:cloud`, `qwen3:480b-cloud`, etc.).
+
+**Pull and run:**
+
+```bash
+ollama pull gemma4:31b-cloud
+ollama run gemma4:31b-cloud
+```
+
+**Management commands:**
+
+```bash
+ollama list        # shows '-' for size on cloud models
+ollama stop gemma4:31b-cloud
+ollama rm gemma4:31b-cloud
+```
+
+> **Pro tip:** Cloud models always run at their **full** advertised context length (often 128K+). No more guessing what your GPU can handle.
+
+### Integration with Roo Code
+
+1. Open Roo Code settings
+2. Set API Provider = **Ollama**
+3. Leave Base URL default
+4. Select your `:cloud` model from the dropdown
+
+It works OK but as expected is slower and less capable than pure Claude Opus 4.6.
+
+### Pricing (as of April 2026)
+
+| Plan     | Price             | Details                                                                |
+| -------- | ----------------- | ---------------------------------------------------------------------- |
+| **Free** | $0                | Light usage — fine for chatting, testing big models, occasional coding |
+| **Pro**  | $20/mo or $200/yr | Day-to-day work, 3 concurrent cloud models, ~50% more usage            |
+| **Max**  | $100/mo           | Heavy agentic workloads, 10 concurrent models, highest limits          |
+
+Local models remain completely unlimited on any plan.
+
+### Pros
+
+- No GPU/RAM required on your machine
+- Seamless with every Ollama-compatible tool (Roo Code, Continue.dev, Open WebUI, etc.)
+- Strong privacy guarantees
+- Full context lengths
+
+### Cons
+
+- Internet required (no offline)
+- Usage limits on Free tier
+- Slight added latency vs. local (still faster than many pure cloud APIs for most tasks)
+
+## 2. LM Studio on a Spare Machine: Your Own Private Inference Server
+
+### What it is
+
+LM Studio is a desktop app for discovering, downloading, and running GGUF models. Its **LM Link** feature (powered by Tailscale) lets you securely connect multiple machines — your daily driver and a spare rig — so you can load models running on the spare as if they were local. End-to-end encrypted, works over the internet, not just LAN.
+
+### Setup
+
+**On the spare/remote machine (the "server"):**
+
+1. Download LM Studio from [https://lmstudio.ai/download](https://lmstudio.ai/download)
+2. Search & download a model via the magnifying glass (try high-quant GGUF for best speed)
+3. In Developer settings (`Cmd/Ctrl + 2`), load the model
+4. Click the link icon at the bottom of the sidebar → Sign in (creates your LM Link account)
+5. Set Status to **Running**
+6. _(Optional but recommended)_ Enable "Serve on local network" for fallback LAN access
+
+**On your daily driver:**
+
+1. Install LM Studio
+2. Click the same link icon → Sign in and connect to your remote machine
+3. Go to **My Models** → filter **Remote**
+4. Click the settings icon next to the model → **Load Model** and set context length (experiment — my i5 + 32 GB spare can often handle 32K–128K depending on quantization)
+
+You should then be able to chat with the model running on your spare machine.
+
+### Integration with Roo Code
+
+Same as Ollama: set provider to OpenAI-compatible, point Base URL to your LM Studio server (it auto-detects via LM Link). Unfortunately Roo Code requires large context windows that my spare hardware struggles with — I may need to experiment or buy new hardware.
+
+### Pros
+
+- Total privacy and control (everything stays on your hardware)
+- No monthly fees
+- You can run any GGUF model (including experimental or fine-tunes)
+- LM Link makes it feel native
+
+### Cons
+
+- Spare machine must stay powered on
+- Network latency (noticeable in fast agentic loops)
+- Context length and speed limited by spare hardware (my 32 GB / i5 example is solid for 7B–34B quantized models)
+- Slightly more setup than Ollama Cloud
+
+## Quick Comparison Table
+
+| Feature              | Ollama Cloud               | LM Studio + Spare Machine | Pure Cloud (Claude/Groq) |
+| -------------------- | -------------------------- | ------------------------- | ------------------------ |
+| Hardware needed      | None                       | Spare machine             | None                     |
+| Monthly cost         | Free – $100                | $0                        | $20–$200+                |
+| Privacy              | Strong (no data retention) | Best (on-prem)            | Provider-dependent       |
+| Max context          | Full (model-dependent)     | Hardware-limited          | Very large               |
+| Latency              | Low–medium                 | Medium (network)          | Lowest (for Groq)        |
+| Roo Code integration | Excellent                  | Excellent                 | Native                   |
+| Offline              | No                         | Yes                       | No                       |
+
+## Other Strong Alternatives Worth Trying
+
+### Pure cloud inference platforms (fastest responses)
+
+- **Groq** — blazing inference speeds
+- **OpenRouter** — one API to 100+ models with smart routing
+- **Together.ai / Fireworks.ai** — great for open models at scale
+
+### Rent a GPU in the cloud
+
+Services like **RunPod**, **Vast.ai**, or **Massed Compute** let you spin up a cheap GPU instance, install Ollama, and expose the OpenAI-compatible API. Combine with Roo Code or LM Link for a fully custom rig without owning hardware.
+
+### Open WebUI + remote Ollama
+
+If you prefer a ChatGPT-like web interface, point **Open WebUI** at either Ollama Cloud or your LM Studio server.
+
+## Final Thoughts
+
+These setups cover the two most practical paths for most power users. **Ollama Cloud** wins for simplicity and zero hardware hassle — perfect when you just want a 31B+ model _now_. **LM Studio + spare machine** (especially with LM Link) wins for privacy and cost if you already have extra hardware lying around.
+
+Most people end up mixing both: use Claude Opus 4.6 or Groq for the absolute highest-quality agentic coding, fall back to Ollama Cloud for daily work, and keep a local/LM Studio rig for sensitive projects or offline use.
+
+Try both setups side-by-side in Roo Code and see which feels better for your workflow. The local-LLM ecosystem has never been more mature — 2026 really is the year you can have frontier-level models without selling your GPU soul.
+
+Happy experimenting!
