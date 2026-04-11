@@ -1,0 +1,324 @@
+---
+title: "Lightweight Load Testing on Windows 11: Building a Complete k6 + Flask + Plotly Pipeline Without the DevOps Overhead"
+description: "How I built an end-to-end load testing solution using k6, Flask, psutil, pandas and Plotly — no Docker, Prometheus or Grafana required — that runs natively on two Windows 11 machines and generates a self-contained interactive dashboard."
+pubDate: 2026-04-11
+author: "Paul Yardley"
+tags:
+  [
+    "k6",
+    "Load Testing",
+    "Performance Testing",
+    "Flask",
+    "Python",
+    "Plotly",
+    "Windows 11",
+    "Dashboard",
+  ]
+readingTime: "12 min read"
+draft: false
+---
+
+Most load testing tutorials assume you're running Linux, Docker, and a full observability stack — Prometheus for metrics, Grafana for dashboards, InfluxDB for storage. That's fine for production environments, but when you just want to load-test a service from your home network using two Windows machines, the setup overhead can be absurd. You end up spending more time configuring infrastructure than actually testing.
+
+This post walks through a complete, lightweight alternative: a **k6 load testing pipeline** that runs natively on Windows 11, collects system metrics via a Flask endpoint, and generates a beautiful interactive dashboard — all without Docker, Prometheus, Grafana, or any heavy tooling.
+
+The full project is [available on GitHub](https://github.com/pyardley/K6Metrics).
+
+## The Problem: Load Testing Shouldn't Require a Platform Team
+
+I had a simple goal: run load tests from one Windows 11 machine against a web application on another Windows 11 machine on the same home network, and see both the **k6 performance metrics** (response time, throughput, error rate) and the **server's resource usage** (CPU, memory) on a single timeline.
+
+The typical recommendation for this involves:
+
+1. Install Docker (or WSL2) on both machines
+2. Run Prometheus + Node Exporter on the server
+3. Configure k6 to push metrics to InfluxDB or Prometheus
+4. Run Grafana with pre-built dashboards
+5. Configure networking, firewall rules, and volume mounts
+
+That's a lot of moving parts for what should be a straightforward task. I wanted something I could set up in 15 minutes and explain to someone who's never heard of Prometheus.
+
+## The Solution: Five Tools, Zero Services
+
+The entire pipeline uses only:
+
+| Tool | Role | Install |
+|---|---|---|
+| **k6** | Load test runner | `winget install Grafana.k6` |
+| **Flask** | Application Under Test + metrics endpoint | `pip install flask` |
+| **psutil** | System resource monitoring | `pip install psutil` |
+| **pandas** | Data parsing and merging | `pip install pandas` |
+| **Plotly** | Interactive HTML dashboard | `pip install plotly` |
+
+No databases, no background services, no YAML configuration files. Everything runs as a simple process and produces plain files (JSON, JSONL, HTML).
+
+## Architecture: Two Machines, One Network
+
+The setup splits cleanly across two machines:
+
+**Remote machine** runs the Flask application — the target being tested. It exposes a `/metrics` endpoint that returns CPU, memory and disk usage as JSON using psutil. No separate monitoring agent needed.
+
+**Local machine** runs k6 tests and a Python orchestrator that coordinates everything: starting a background metrics collector, launching k6, parsing the results, and generating the dashboard.
+
+The data flow is:
+
+1. The orchestrator starts polling `/metrics` on the remote machine every second
+2. k6 runs the load test, hitting the remote endpoints and writing results to JSON
+3. After k6 finishes, the orchestrator stops the metrics collector
+4. pandas parses and merges both datasets by timestamp
+5. Plotly generates a self-contained HTML dashboard
+
+## The Application Under Test
+
+The Flask app is intentionally minimal — four endpoints:
+
+```python
+@app.route("/")
+def index():
+    # Returns HTML: "Hello from the AUT – Load Test Target"
+
+@app.route("/api/data")
+def api_data():
+    # Returns JSON with sample product data
+
+@app.route("/api/submit", methods=["POST"])
+def api_submit():
+    # Accepts JSON and echoes it back
+
+@app.route("/metrics")
+def metrics():
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    return jsonify({
+        "cpu_percent": cpu_percent,
+        "memory": {
+            "total_gb": round(mem.total / (1024 ** 3), 2),
+            "used_gb": round(mem.used / (1024 ** 3), 2),
+            "percent": mem.percent,
+        },
+        "disk_percent": disk.percent,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+```
+
+The key design choice is embedding the `/metrics` endpoint directly in the Flask app. This eliminates the need for a separate monitoring agent entirely. Since psutil reads system stats directly from the OS, the metrics are accurate and real-time. The 100ms sample window in `cpu_percent(interval=0.1)` keeps the endpoint responsive even under load.
+
+Running it is one command: `python app.py`. It binds to `0.0.0.0:5000` so it's accessible from the network.
+
+## The k6 Test Scripts
+
+I created two scripts — a load test and a stress test — each targeting all three application endpoints.
+
+The **load test** simulates normal-to-heavy traffic:
+
+```javascript
+export const options = {
+  stages: [
+    { duration: "30s", target: 10 },   // Warm up
+    { duration: "30s", target: 50 },   // Ramp to peak
+    { duration: "2m",  target: 50 },   // Sustained load
+    { duration: "30s", target: 0 },    // Cool down
+  ],
+  thresholds: {
+    http_req_duration: ["p(95)<500"],   // 95th percentile under 500ms
+    http_req_failed:   ["rate<0.05"],   // Less than 5% error rate
+  },
+};
+```
+
+The **stress test** pushes harder and faster — ramping to 150 VUs with shorter sleep times between requests.
+
+Both scripts use `check()` to verify every response:
+
+```javascript
+const resData = http.get(`${BASE_URL}/api/data`);
+check(resData, {
+  "GET /api/data → status 200": (r) => r.status === 200,
+  "GET /api/data → has products": (r) => {
+    const body = JSON.parse(r.body);
+    return body.products && body.products.length > 0;
+  },
+});
+```
+
+k6's `--out json=results.json` flag writes every metric data point to a file, which the dashboard generator later parses.
+
+## The Metrics Collector
+
+Rather than deploying a monitoring agent on the remote machine, the local machine polls the `/metrics` endpoint in a background thread:
+
+```python
+class MetricsCollector:
+    def __init__(self, metrics_url, output_file, interval=1.0):
+        self._stop_event = threading.Event()
+        self.samples = []
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            resp = requests.get(self.metrics_url, timeout=3)
+            data = resp.json()
+            self.samples.append(data)
+            self._stop_event.wait(self.interval)  # Sleep or stop
+```
+
+This approach has a significant advantage: **zero installation on the remote machine** beyond the Flask app itself. The collector writes JSON Lines (one JSON object per line) for efficient streaming and easy parsing. It handles connection errors gracefully — if the remote is temporarily too busy to respond, it logs the error and keeps polling.
+
+## The Orchestrator: Tying It All Together
+
+The `generate_dashboard.py` script is the brain. It coordinates the entire pipeline in sequence:
+
+1. **Connectivity check** — hits the remote URL and fails fast with a clear error if unreachable
+2. **Start metrics collector** — begins background polling before k6 starts
+3. **Run k6** — executes the test as a subprocess
+4. **Stop collector** — ensures all metrics from the test period are captured
+5. **Parse k6 output** — reads the NDJSON file into a pandas DataFrame
+6. **Parse system metrics** — reads the JSONL file into another DataFrame
+7. **Aggregate** — groups k6 data into 1-second buckets (avg, p95, max response time, requests/sec)
+8. **Merge** — uses `pd.merge_asof` to align k6 and system metrics by nearest timestamp
+9. **Generate dashboard** — produces a self-contained HTML file with Plotly charts
+
+The merge step is worth explaining. k6 records timestamps per-request (potentially thousands per second), while the metrics collector records one sample per second. Aggregating k6 data into 1-second buckets and then merging with `merge_asof(direction="nearest", tolerance="2s")` aligns them cleanly without requiring perfectly synchronised clocks.
+
+One gotcha I hit: **pandas datetime resolution mismatch**. k6's timestamps parsed as `datetime64[ns, UTC]` while the system metrics came in as `datetime64[us, UTC]`. Newer versions of pandas are strict about this in merge operations. The fix was simple — normalise both to the same resolution before merging:
+
+```python
+left["timestamp"] = left["timestamp"].dt.as_unit("us")
+right["timestamp"] = right["timestamp"].dt.as_unit("us")
+```
+
+## The Dashboard
+
+The generated HTML file is completely self-contained — Plotly.js is embedded inline, so it works offline with no external dependencies. It includes four interactive charts:
+
+1. **Response Time vs CPU Usage** — k6 average and P95 response times on the left axis, remote CPU% on the right. This immediately shows whether response time degradation correlates with CPU saturation.
+
+2. **Requests Per Second vs Memory Usage** — throughput bars with memory% overlaid. Useful for spotting memory leaks or allocation pressure under load.
+
+3. **Error Rate Over Time** — a filled area chart showing when errors occur. In a healthy test this should be flat at zero; spikes indicate the server is struggling.
+
+4. **System Resources Detail** — CPU, memory and disk usage on the remote machine over the full test duration.
+
+Above the charts, summary tables show key statistics at a glance: average response time, P95, peak throughput, error rate, average CPU, peak memory.
+
+## The First Real Test Run
+
+Running the load test against the Flask app on the remote machine:
+
+```
+k6 load test results:
+  14,556 requests at 69 req/s over 3m30s
+  0% error rate — all 29,112 checks passed
+  P95 response time: 50.84ms (threshold: 500ms)
+  184 system metric samples collected
+```
+
+Everything passed cleanly. The Flask development server handled 50 concurrent virtual users without breaking a sweat — which is expected for simple endpoints, but it's good to have the numbers and the visual confirmation on the dashboard.
+
+## Why Not the Alternatives?
+
+### Prometheus + Grafana
+
+The industry standard for monitoring and dashboards. For a production environment, it's the right choice. But for a two-machine home network setup:
+
+- **Pros**: Battle-tested, rich ecosystem, real-time streaming dashboards, alerting
+- **Cons**: Requires running 3+ services (Prometheus, Grafana, optionally InfluxDB), YAML configuration, port management, and ideally Docker. On Windows without WSL, the setup is particularly painful. Grafana needs a running web server — you can't just email someone an HTML file.
+
+### k6 Cloud
+
+Grafana offers a hosted solution for k6 results.
+
+- **Pros**: Zero infrastructure, beautiful dashboards, team collaboration
+- **Cons**: Requires internet connectivity, paid beyond free tier limits, doesn't include server-side resource metrics (you'd still need something like Prometheus for CPU/memory data)
+
+### Apache JMeter
+
+The veteran of load testing tools.
+
+- **Pros**: GUI-based test design, huge plugin ecosystem, built-in HTML report generation
+- **Cons**: Java dependency (JVM overhead), XML-based test plans are hard to version control, the GUI can be sluggish, and it uses more resources than k6 for the same number of virtual users. k6's JavaScript-based scripts are far more readable and maintainable.
+
+### Locust
+
+Python-based load testing — a natural fit given the rest of the stack is Python.
+
+- **Pros**: Python test scripts (no context-switching), built-in web UI, distributed mode
+- **Cons**: The built-in UI is real-time only (no post-test report generation without plugins), and combining it with system metrics requires the same kind of custom integration I built here. k6 has better protocol support and lower per-VU overhead.
+
+### The Case for This Approach
+
+The approach I've built isn't better than Prometheus + Grafana in absolute terms. It's better **for this specific use case**: ad-hoc load testing from a home network with minimal setup, producing a shareable artefact (the HTML dashboard) that anyone can open in a browser.
+
+The advantages are:
+
+1. **No services to run** — everything is file-based
+2. **No configuration files** — no YAML, no Docker Compose, no database schemas
+3. **Self-contained output** — the dashboard is a single HTML file you can email, commit to Git, or archive
+4. **Windows-native** — no WSL, no Docker Desktop, no Linux knowledge required
+5. **Easy to understand** — the entire pipeline is ~400 lines of Python and ~80 lines of JavaScript
+6. **Easy to extend** — want to add a new chart? It's a few lines of Plotly. Want to monitor a different metric? Add it to the Flask `/metrics` endpoint.
+
+The disadvantages are equally clear:
+
+1. **No real-time streaming** — you see results after the test, not during
+2. **Polling-based metrics** — 1-second resolution, not sub-second
+3. **Single-machine load generation** — k6 runs on one machine (though k6 supports distributed execution if needed)
+4. **No alerting** — it's a reporting tool, not a monitoring system
+
+## Setting It Up: The 10-Minute Version
+
+If you want to replicate this, clone the repo and follow these steps:
+
+**On the remote machine:**
+
+```cmd
+pip install flask psutil
+python app.py
+```
+
+**On the local machine:**
+
+```cmd
+winget install Grafana.k6
+pip install requests pandas plotly
+copy config.json.example config.json
+```
+
+Edit `config.json` with your remote machine's IP or hostname:
+
+```json
+{
+  "remote_host": "YOUR-REMOTE-MACHINE",
+  "remote_port": 5000,
+  "remote_url": "http://192.168.x.x:5000"
+}
+```
+
+Then run the test — the remote URL is read from your config automatically:
+
+```cmd
+python generate_dashboard.py --test load
+start results\dashboard.html
+```
+
+The `config.json` file is Git-ignored, so your network details stay private. All scripts read their defaults from this file, with the option to override via command-line flags.
+
+The only fiddly part is **Windows Firewall** — you need to allow inbound TCP on port 5000 on the remote machine:
+
+```powershell
+# Run as Administrator on the remote machine
+netsh advfirewall firewall add rule name="Allow Flask Port 5000" dir=in action=allow protocol=TCP localport=5000
+```
+
+## Key Takeaways
+
+1. **Load testing doesn't require a platform** — for many use cases, k6 + a simple metrics endpoint + a Python script is all you need
+2. **Embed your metrics endpoint** — putting `/metrics` in the Flask app itself eliminates the need for a separate monitoring agent
+3. **File-based pipelines are underrated** — JSON in, HTML out, no databases, no services, no state to manage
+4. **pandas `merge_asof` is perfect for time-series alignment** — it handles the clock skew and different sampling rates between k6 and the metrics collector elegantly
+5. **Self-contained HTML dashboards are shareable** — Plotly.js embedded in a single file means anyone with a browser can explore the results, no server required
+6. **Start simple, add complexity when you need it** — if this approach stops being sufficient, migrating to Prometheus + Grafana is straightforward because the data shapes are already clean
