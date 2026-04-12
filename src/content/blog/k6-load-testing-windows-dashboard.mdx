@@ -42,13 +42,13 @@ That's a lot of moving parts for what should be a straightforward task. I wanted
 
 The entire pipeline uses only:
 
-| Tool | Role | Install |
-|---|---|---|
-| **k6** | Load test runner | `winget install Grafana.k6` |
-| **Flask** | Application Under Test + metrics endpoint | `pip install flask` |
-| **psutil** | System resource monitoring | `pip install psutil` |
-| **pandas** | Data parsing and merging | `pip install pandas` |
-| **Plotly** | Interactive HTML dashboard | `pip install plotly` |
+| Tool       | Role                                      | Install                     |
+| ---------- | ----------------------------------------- | --------------------------- |
+| **k6**     | Load test runner                          | `winget install Grafana.k6` |
+| **Flask**  | Application Under Test + metrics endpoint | `pip install flask`         |
+| **psutil** | System resource monitoring                | `pip install psutil`        |
+| **pandas** | Data parsing and merging                  | `pip install pandas`        |
+| **Plotly** | Interactive HTML dashboard                | `pip install plotly`        |
 
 No databases, no background services, no YAML configuration files. Everything runs as a simple process and produces plain files (JSON, JSONL, HTML).
 
@@ -115,14 +115,14 @@ The **load test** simulates normal-to-heavy traffic:
 ```javascript
 export const options = {
   stages: [
-    { duration: "30s", target: 10 },   // Warm up
-    { duration: "30s", target: 50 },   // Ramp to peak
-    { duration: "2m",  target: 50 },   // Sustained load
-    { duration: "30s", target: 0 },    // Cool down
+    { duration: "30s", target: 10 }, // Warm up
+    { duration: "30s", target: 50 }, // Ramp to peak
+    { duration: "2m", target: 50 }, // Sustained load
+    { duration: "30s", target: 0 }, // Cool down
   ],
   thresholds: {
-    http_req_duration: ["p(95)<500"],   // 95th percentile under 500ms
-    http_req_failed:   ["rate<0.05"],   // Less than 5% error rate
+    http_req_duration: ["p(95)<500"], // 95th percentile under 500ms
+    http_req_failed: ["rate<0.05"], // Less than 5% error rate
   },
 };
 ```
@@ -193,17 +193,63 @@ right["timestamp"] = right["timestamp"].dt.as_unit("us")
 
 ## The Dashboard
 
-The generated HTML file is completely self-contained — Plotly.js is embedded inline, so it works offline with no external dependencies. It includes four interactive charts:
+The generated HTML file is completely self-contained — Plotly.js is embedded inline, so it works offline with no external dependencies. It includes summary statistics and four interactive charts.
 
-1. **Response Time vs CPU Usage** — k6 average and P95 response times on the left axis, remote CPU% on the right. This immediately shows whether response time degradation correlates with CPU saturation.
+### Summary Statistics
 
-2. **Requests Per Second vs Memory Usage** — throughput bars with memory% overlaid. Useful for spotting memory leaks or allocation pressure under load.
+![k6 Load Test Dashboard — summary statistics showing k6 performance and system resource metrics](/blog/k6-basic-summary-stats.png)
 
-3. **Error Rate Over Time** — a filled area chart showing when errors occur. In a healthy test this should be flat at zero; spikes indicate the server is struggling.
+The dashboard header shows two summary panels side by side:
 
-4. **System Resources Detail** — CPU, memory and disk usage on the remote machine over the full test duration.
+**k6 Performance Summary** captures the key load test numbers:
 
-Above the charts, summary tables show key statistics at a glance: average response time, P95, peak throughput, error rate, average CPU, peak memory.
+- **Total Duration (s)** — the wall-clock time of the entire test run (210 seconds / 3.5 minutes). This covers all k6 stages: warm-up, ramp to peak, sustained load, and cool-down.
+- **Avg Response Time (ms)** — the arithmetic mean of all HTTP response durations (25.6ms). A low average suggests the server is handling requests comfortably, but this metric alone can mask occasional slow responses.
+- **P95 Response Time (ms)** — the 95th percentile response time (35.53ms). This means 95% of all requests completed within 35.53ms. P95 is more useful than the average for understanding real user experience, because it captures the "worst case for most users" rather than being dragged down by the fast majority.
+- **Max Response Time (ms)** — the single slowest response recorded (107.97ms). This is the absolute worst case — useful for identifying outliers, but a single spike doesn't necessarily indicate a problem.
+- **Avg Requests/sec** — the mean throughput over the test duration (70.2 req/s). This tells you the sustained load the server handled.
+- **Peak Requests/sec** — the highest throughput recorded in any 1-second bucket (100 req/s). This is the maximum burst the server sustained.
+- **Avg Error Rate (%)** — the percentage of requests that returned non-2xx status codes or timed out (0.0%). Zero means every request succeeded.
+
+**System Resource Summary** shows the remote server's health during the test:
+
+- **Avg CPU (%)** — average CPU utilisation across the test (42.0%). Indicates the server had headroom — sustained CPU above 80% would be a warning sign.
+- **Max CPU (%)** — the peak CPU reading (100.0%). The server hit full CPU utilisation at least once, likely during the sustained 50-VU phase. Worth investigating if this correlates with response time spikes.
+- **Avg Memory (%)** — average memory utilisation (32.5%). Well within safe limits — memory wasn't a bottleneck.
+- **Max Memory (%)** — peak memory usage (32.8%). Almost identical to the average, confirming no memory leaks or allocation spikes.
+- **Avg Disk (%)** — average disk utilisation (65.4%). This is the percentage of disk space used, not I/O throughput.
+
+### Response Time vs CPU Usage
+
+![k6 Response Time vs CPU Usage — dual-axis chart showing average and P95 response times alongside CPU percentage](/blog/k6-basic-response-time-vs-cpu.png)
+
+This dual-axis chart is the most important view in the dashboard. The left axis shows response time in milliseconds (blue solid line = average, purple dashed line = P95), while the right axis shows CPU percentage (red line).
+
+The key insight is **correlation**: when CPU spikes to 80–100%, do response times spike too? In this test, the average response time stays remarkably stable around 20–30ms even as CPU fluctuates wildly between 20% and 100%. This tells us the Flask app is handling the load well — the CPU spikes are likely from other processes on the machine, not from the application struggling. The P95 line shows occasional jumps to 40–80ms, indicating that while most requests are fast, a small percentage take 2–3x longer during high-CPU moments.
+
+### Requests Per Second vs Memory Usage
+
+![Requests Per Second vs Memory Usage — bar chart of throughput with memory percentage overlay](/blog/k6-basic-rps-vs-memory.png)
+
+This chart overlays throughput (teal bars, left axis) with memory usage (orange line, right axis). The bar chart shape clearly shows the k6 test profile: ramp-up from 0 to ~100 req/s over the first 30 seconds, sustained at ~95–100 req/s during the 2-minute peak phase, then ramp-down in the final 30 seconds.
+
+The flat memory line at ~33% is exactly what you want to see — it means the Flask application isn't leaking memory under load. If this line trended upward during the sustained phase, it would indicate a memory leak that could eventually crash the server in a longer test.
+
+### Error Rate Over Time
+
+![Error Rate Over Time — flat line at 0% indicating no errors during the test](/blog/k6-basic-error-rate.png)
+
+A flat line at 0% across the entire test duration — every request returned a successful response. This is the ideal result. In a stress test pushing beyond server capacity, you'd expect to see this line spike as the server starts returning 500 errors or timing out. The fact that it stayed at zero even at 100 req/s confirms the Flask app handled the load without failures.
+
+### Remote System Resource Usage
+
+![Remote System Resource Usage — CPU, memory and disk percentage over the test duration](/blog/k6-basic-system-resources.png)
+
+This chart shows all three system metrics on a single timeline:
+
+- **CPU % (red)** — the most volatile metric, swinging between 0% and 100%. The high variance is typical of a multi-core Windows system where psutil reports aggregate CPU across all cores. The frequent spikes to 80–100% during the sustained load phase (50–190 seconds) show the server was working hard.
+- **Memory % (orange)** — flat at ~33% throughout, confirming no memory pressure from the test.
+- **Disk % (blue dashed)** — flat at ~65%, representing disk space utilisation rather than I/O activity. This baseline metric is useful for long-running tests where disk space could become an issue (e.g., logging).
 
 ## The First Real Test Run
 
