@@ -36,30 +36,55 @@ RAG solves all three by **retrieving only the most relevant chunks** for a given
 
 ## The Pipeline
 
-```
-Confluence pages
-      │
-      ▼
-  ConfluenceLoader          – fetches raw page content via the Confluence REST API
-      │
-      ▼
-RecursiveCharacterTextSplitter  – breaks pages into overlapping chunks (1000 chars, 100 overlap)
-      │
-      ▼
-  HuggingFace Embeddings    – converts each chunk into a vector (all-MiniLM-L6-v2, runs locally)
-      │
-      ▼
-    ChromaDB                – stores vectors on disk in ./chroma_db
-      │
-      ▼  (at query time)
-    Retriever               – finds the top-3 most semantically similar chunks
-      │
-      ▼
-  Claude (Anthropic)        – reads the chunks as context and generates a grounded answer
-      │
-      ▼
-  Answer + Source URLs
-```
+#### Confluence pages
+
+The source of truth - whatever pages live in the configured space.
+
+↓
+
+#### ConfluenceLoader
+
+Fetches raw page content via the Confluence REST API.
+
+↓
+
+#### RecursiveCharacterTextSplitter
+
+Breaks pages into overlapping chunks (1000 characters, 100-character overlap).
+
+↓
+
+#### HuggingFace Embeddings
+
+Converts each chunk into a vector using `all-MiniLM-L6-v2`, which runs locally on CPU.
+
+↓
+
+#### ChromaDB
+
+Stores the vectors on disk in `./chroma_db`.
+
+↓
+
+_(at query time)_
+
+↓
+
+#### Retriever
+
+Finds the top-3 most semantically similar chunks for the incoming question.
+
+↓
+
+#### Claude (Anthropic)
+
+Reads the retrieved chunks as context and generates a grounded answer.
+
+↓
+
+#### Answer + Source URLs
+
+Returned to the user, with links back to the original Confluence pages.
 
 Two scripts do the work:
 
