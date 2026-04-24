@@ -1,0 +1,388 @@
+---
+title: "CorporateRAG: Ask Natural-Language Questions Across Jira, Confluence, SQL Server and GitHub"
+description: "How I built a multi-source RAG system that indexes Jira, Confluence, SQL Server and GitHub into a single vector index and answers natural-language questions with grounded, cited answers."
+pubDate: 2026-04-24
+author: "Paul Yardley"
+tags:
+  [
+    "RAG",
+    "Jira",
+    "Confluence",
+    "GitHub",
+    "Pinecone",
+    "LangChain",
+    "Python",
+    "AI",
+    "Anthropic",
+  ]
+readingTime: "14 min read"
+draft: false
+---
+
+Most companies store their knowledge in at least four places at once: a project tracker, a wiki, a database and version control. Answering a question like _"What changed in the authentication service last month and is there a Jira ticket for it?"_ normally means opening four tabs, copying text between them, and doing the synthesis yourself.
+
+So I built something better. CorporateRAG is a **Retrieval-Augmented Generation (RAG)** application with four data connectors — Jira, Confluence, SQL Server and GitHub — that pulls everything into a single vector index and puts a chat interface on top. You ask a question in plain English; the system retrieves the most relevant chunks from whichever sources you have enabled, then uses an LLM to write a grounded, cited answer.
+
+This post walks through how the system works, the design choices that shaped it and the alternatives I considered for each component.
+
+## The Problem It Solves
+
+Developers and project managers constantly context-switch between tools. A typical investigation might go like this:
+
+- Check Jira to understand the scope of a bug
+- Read the Confluence design doc to understand the intended behaviour
+- Query the database to find the stored procedure that implements it
+- Check the Git log to see what changed and when
+
+That's four tabs, four logins, four mental models and a synthesis step you do entirely in your head.
+
+CorporateRAG compresses this into a single question. Because retrieval is semantic rather than keyword-based, a query like _"buffer overflow error in the payment service"_ will match a Jira comment that says _"stack corruption in the billing module"_ without needing exact wording.
+
+## The Pipeline
+
+There are two phases: **ingestion** (run once, then refresh) and **query** (run as often as you like).
+
+#### Source APIs
+
+Jira, Confluence, SQL Server and GitHub — raw data fetched via their respective APIs.
+
+↓
+
+#### load_documents()
+
+Each ingestor normalises its source into plain text with metadata: a Jira issue becomes its summary, description and comments; a Confluence page becomes cleaned markdown; a SQL Server procedure becomes its definition; a GitHub commit becomes its message and changed file list.
+
+↓
+
+#### RecursiveCharacterTextSplitter
+
+Breaks each document into overlapping chunks (1000 characters, 200-character overlap by default).
+
+↓
+
+#### OpenAIEmbeddings / HuggingFaceEmbeddings
+
+Converts each chunk into a vector using either `text-embedding-3-small` or `all-MiniLM-L6-v2` — whichever you configure. The same model must be used at ingest and query time.
+
+↓
+
+#### Pinecone.upsert()
+
+Stores vectors with a rich metadata envelope: `user_id`, `source`, `project_key` / `space_key` / `db_name` / `branch` and the original text.
+
+↓
+
+#### IngestionLog (SQLite)
+
+Records the run status, item count, vectors upserted and the `last_item_updated_at` timestamp used for incremental re-ingestion.
+
+↓
+
+_(at query time)_
+
+↓
+
+#### Retriever
+
+Embeds the query, then runs a metadata-filtered nearest-neighbour search in Pinecone scoped to your `user_id` and any source or scope filters you have set in the sidebar.
+
+↓
+
+#### LLM (OpenAI / Anthropic / Grok)
+
+Receives the top-k chunks as numbered context and synthesises a markdown answer.
+
+↓
+
+#### Answer + Citations
+
+Returned to the user with inline `[N]` references linked to the original source — a Jira ticket URL, a Confluence page, a GitHub commit, or a SQL Server object name.
+
+Two scripts drive the pipeline from the CLI:
+
+| Script      | Purpose                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------ |
+| `ingest.py` | Fetches data from each source, chunks, embeds and upserts into Pinecone                          |
+| `query.py`  | Embeds an incoming question, retrieves relevant chunks and calls the LLM to synthesise an answer |
+
+Ingestion can also be triggered from the Streamlit sidebar — useful when you want to refresh a single source without touching the CLI.
+
+## The Design Choices
+
+### Pinecone for the vector store
+
+The core requirement was a vector store that supports **metadata filtering** — specifically, filtering by `user_id` so that vectors from different users never appear in each other's results. Pinecone's serverless tier handles this natively, scales without operational overhead and has a generous free tier.
+
+For a project that needs to store vectors for dozens of users each with thousands of documents, a file-based store like ChromaDB would buckle. Pinecone's serverless model means the index scales without thinking about it.
+
+### Multi-tenant isolation at the vector level
+
+Every vector carries a `user_id` field. All retrieval queries start with a hard equality filter on it, making cross-user data leakage impossible at the vector store level — regardless of how the application layer behaves:
+
+```python
+# core/retriever.py
+def build_filter(user_id, sources=None, project_keys=None,
+                 space_keys=None, db_names=None, git_branches=None):
+    filt = {"user_id": {"$eq": user_id}}
+
+    if sources:
+        filt["source"] = {"$in": sources}
+
+    sub_conditions = []
+    if project_keys:
+        sub_conditions.append({"project_key": {"$in": project_keys}})
+    if space_keys:
+        sub_conditions.append({"space_key": {"$in": space_keys}})
+    if db_names:
+        sub_conditions.append({"db_name": {"$in": db_names}})
+    if git_branches:
+        sub_conditions.append({"branch": {"$in": git_branches}})
+
+    if len(sub_conditions) == 1:
+        filt.update(sub_conditions[0])
+    elif sub_conditions:
+        filt["$or"] = sub_conditions
+
+    return filt
+```
+
+The `$or` structure lets you query across multiple projects, spaces, or branches in a single round-trip — without widening the user boundary.
+
+### Jira's ADF format
+
+Jira Cloud returns issue descriptions and comments as **Atlassian Document Format (ADF)** — a nested JSON tree, not plain text. If you try to embed it directly, every issue with a formatted description produces a near-empty chunk. The ingestor recursively walks the tree to extract clean text:
+
+````python
+# app/ingestion/jira_ingestor.py
+def _adf_to_text(node) -> str:
+    if not node:
+        return ""
+    if isinstance(node, str):
+        return node
+    node_type = node.get("type", "")
+    if node_type == "text":
+        return node.get("text", "")
+    if node_type == "hardBreak":
+        return "\n"
+    children = [_adf_to_text(c) for c in node.get("content", [])]
+    if node_type in ("paragraph", "heading"):
+        return "".join(children).strip()
+    if node_type in ("bulletList", "orderedList"):
+        return "\n".join(f"• {c.strip()}" for c in children if c.strip())
+    if node_type == "codeBlock":
+        return "```\n" + "".join(children) + "\n```"
+    return "\n".join(c for c in children if c.strip())
+````
+
+Without this, every Jira issue with a formatted description would produce an empty embedding — the comment bodies would just read `[object Object]`.
+
+### Idempotent vector IDs
+
+Rather than letting Pinecone generate random IDs, each chunk gets a deterministic SHA-256 ID based on its source coordinates:
+
+```python
+# app/ingestion/base.py
+chunk_id = hashlib.sha256(
+    f"{self.user_id}:{self.SOURCE}:{item_id}:{chunk_index}".encode()
+).hexdigest()
+```
+
+Re-running a full ingestion overwrites existing vectors rather than duplicating them. You can run it nightly without worrying about index bloat.
+
+### Supporting multiple Confluence instances
+
+Organisations sometimes span more than one Atlassian site. The Confluence ingestor reads `url`, `url_2`, `url_3` credential keys and creates one API client per instance. Secondary instances fall back to the primary credentials unless their own are supplied:
+
+```python
+# app/ingestion/confluence_ingestor.py
+def _make_instances(self):
+    primary_email = self.credentials.get("email", "")
+    primary_token = self.credentials.get("api_token", "")
+
+    for suffix in ["", "_2", "_3", "_4", "_5"]:
+        url = self.credentials.get(f"url{suffix}", "").strip()
+        if not url:
+            continue
+        email = self.credentials.get(f"email{suffix}", "") or primary_email
+        token = self.credentials.get(f"api_token{suffix}", "") or primary_token
+        client = Confluence(url=url, username=email, password=token, cloud=True)
+        self._instances.append((client, url.rstrip("/")))
+```
+
+## What a Query Looks Like
+
+Here are five examples drawn from a real index containing Jira issues, Confluence pages, SQL Server procedures and GitHub commits.
+
+### Cross-source synthesis
+
+**Prompt:** `Explain how app.ingestion.cli works.`
+
+> The ingestion CLI (`app/ingestion/cli.py`) is the command-line entry point for the
+> CorporateRAG data pipeline [1]. It accepts four arguments: `--source` (jira, confluence,
+> sql, git, or all), `--mode` (full or incremental), `--scope` (a project key, space key,
+> branch name, or "all"), and `--email` for authentication [1].
+>
+> In **full mode** the ingestor deletes all existing Pinecone vectors matching the scope
+> filter before re-indexing, ensuring stale content is removed [1]. In **incremental mode**
+> it reads the `last_item_updated_at` timestamp from the SQLite ingestion log and only
+> fetches items modified since that point [2].
+>
+> Sources: **[1]** 🟣 `rag-multi-source/app/ingestion/cli.py` @ `master`  
+> **[2]** 🟣 `rag-multi-source/app/ingestion/base.py` @ `master`
+
+The answer draws from two separate source files, cited by path and branch. A developer could land on the right lines without grepping.
+
+### Jira ticket lookup
+
+**Prompt:** `What does error code ABC123 mean?`
+
+> Error code ABC123 is caused by a buffer overflow [1]. The issue was reported in ticket
+> SCRUM-29 and the root cause was identified in a comment by the assignee.
+>
+> Sources: **[1]** 🔵 [SCRUM-29: Investigate error code ABC123](https://yourorg.atlassian.net/browse/SCRUM-29) `In Progress`
+
+The link goes straight to the ticket. In an incident at 2am that matters.
+
+### Confluence knowledge base
+
+**Prompt:** `What is Robin Gherkin's favourite colour?`
+
+> According to the Favourite Colours page in Confluence, Robin Gherkin's favourite colour
+> is blue [1].
+>
+> Sources: **[1]** 🟢 [Favourite Colours](https://yourorg.atlassian.net/wiki/spaces/SD/pages/123) `SD`
+
+Trivial query, but it demonstrates that the Confluence ingestor converts HTML to clean markdown and the answer cites the exact page.
+
+### SQL Server schema exploration
+
+**Prompt:** `What does the sp_ProcessPayment stored procedure do?`
+
+> `sp_ProcessPayment` validates the incoming payment record, checks the account balance,
+> inserts a transaction row into `dbo.Transactions`, and updates `dbo.AccountBalances` in
+> a single transaction [1]. It returns error code 1001 if the account has insufficient
+> funds and 1002 if the payment reference already exists.
+>
+> Sources: **[1]** 🟠 `PaymentsDB` › `sp_ProcessPayment` (PROCEDURE)
+
+The system indexed the procedure definition directly. No need to open SQL Server Management Studio and hunt for it manually.
+
+### Git history
+
+**Prompt:** `What changed in the ingestion pipeline recently?`
+
+> Three commits touched the ingestion pipeline in the last week [1][2][3]:
+>
+> - `a538526` added the Git data source with `git_ingestor.py` and wired it into the CLI,
+>   sidebar, and retriever.
+> - `1121f5c` updated the README with Git prerequisites and ingestion command examples.
+> - `d86b3ad` was the initial commit establishing the Jira, Confluence, and SQL ingestors.
+>
+> Sources: **[1]** 🟣 [`a538526`](https://github.com/pyardley/CorporateRAG/commit/a538526) `pyardley/CorporateRAG`  
+> **[2]** 🟣 [`1121f5c`](https://github.com/pyardley/CorporateRAG/commit/1121f5c) `pyardley/CorporateRAG`  
+> **[3]** 🟣 [`d86b3ad`](https://github.com/pyardley/CorporateRAG/commit/d86b3ad) `pyardley/CorporateRAG`
+
+Combined with the Jira and Confluence answers, you can reconstruct why a change was made, what the intended behaviour was and which ticket drove it — all in one query.
+
+## Alternative Technologies
+
+### Vector store
+
+| Alternative              | Advantages                                                                    | Disadvantages                                                             |
+| ------------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Pinecone** _(current)_ | Fully managed, serverless free tier, fast metadata filtering, no ops overhead | Proprietary, cost at scale, data leaves your infrastructure               |
+| **Weaviate**             | Open source, self-hostable, native hybrid search (BM25 + vector), GraphQL API | More complex to operate, self-managed at scale                            |
+| **Qdrant**               | Open source, Rust-based (fast), self-hostable, strong filtering               | Smaller ecosystem, fewer managed-cloud options                            |
+| **pgvector**             | Runs in existing Postgres, no extra infrastructure, SQL-native                | Slower at scale without tuning                                            |
+| **Chroma**               | Extremely simple, local file-based, great for prototyping                     | Not designed for multi-user/production; persistence and filtering limited |
+
+Pinecone is the right choice for a managed, zero-ops deployment. Switch to Qdrant if data residency or cost at scale becomes a concern.
+
+### Embeddings
+
+| Alternative                                     | Advantages                                                       | Disadvantages                                        |
+| ----------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------- |
+| **OpenAI `text-embedding-3-small`** _(current)_ | Best-in-class quality, cheap (~$0.02/1M tokens), 1536 dimensions | API cost, data sent to OpenAI, requires internet     |
+| **HuggingFace `all-MiniLM-L6-v2`**              | Free, runs locally, 384 dimensions (smaller index)               | Lower quality on domain-specific text, slower on CPU |
+| **Cohere Embed v3**                             | Strong multilingual support, 1024 dimensions, reranking API      | Additional vendor dependency, cost                   |
+| **Voyage AI**                                   | State-of-the-art on code and technical retrieval benchmarks      | Newer service, cost, less community tooling          |
+
+OpenAI for production quality; HuggingFace if you need air-gapped or zero-cost operation.
+
+### LLM
+
+| Alternative                                | Advantages                                                          | Disadvantages                                            |
+| ------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------- |
+| **OpenAI GPT-4o-mini** _(current default)_ | Fast, cheap, strong instruction following                           | Proprietary, cost, data leaves your infrastructure       |
+| **Anthropic Claude Sonnet** _(supported)_  | Excellent at long-context synthesis, strong reasoning, 200K context | Cost, proprietary                                        |
+| **Ollama (Llama 3, Mistral, etc.)**        | Fully local, free, no data egress                                   | Requires capable GPU, lower quality on complex reasoning |
+| **Azure OpenAI**                           | Same models within your Azure tenant (data residency)               | Azure subscription, more setup overhead                  |
+
+To switch to Claude as the LLM, add these to `.env`:
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+### Orchestration
+
+| Alternative               | Advantages                                                                 | Disadvantages                                                        |
+| ------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| **LangChain** _(current)_ | Large ecosystem, consistent abstractions for embeddings/vector stores/LLMs | Heavy dependency tree, abstractions can obscure bugs                 |
+| **LlamaIndex**            | Stronger focus on RAG-specific patterns, good multi-document indexing      | Overlapping with LangChain, similar complexity                       |
+| **Haystack**              | Production-focused, strong pipeline abstractions, good evaluation tooling  | Steeper learning curve, less Pinecone-native integration             |
+| **Plain Python**          | Zero abstraction overhead, full control, easier debugging                  | Must re-implement chunking, retry logic, provider switching yourself |
+
+## What I'd Add Next
+
+The system is deliberately scoped to what I've actually needed. Natural extensions:
+
+- **Reranking** — add a cross-encoder reranker (Cohere Rerank or a local model) after the initial Pinecone retrieval to improve result ordering before passing to the LLM.
+- **Hybrid search** — combine vector similarity with BM25 keyword search for better recall on exact names (ticket IDs, function names, error codes).
+- **Streaming responses** — stream the LLM output token-by-token using Streamlit's `st.write_stream` to improve perceived latency.
+- **Slack / Teams integration** — expose `answer_query()` behind a bot webhook so users can query without opening the Streamlit app.
+- **Evaluation harness** — use [RAGAS](https://docs.ragas.io/) to score faithfulness and answer relevancy against a ground-truth question set.
+- **More data sources** — SharePoint, Notion, Google Drive, email (the `BaseIngestor` interface makes this straightforward to add).
+
+## Key Takeaways
+
+1. **Multi-source RAG is the right pattern for engineering teams.** Context windows are big but not infinite and four tabs of context-switching is a solvable problem.
+2. **Metadata filtering is non-negotiable in a shared deployment.** Without a hard `user_id` filter at the vector store level, multi-tenancy is a promise the application layer can accidentally break.
+3. **Source-specific quirks compound fast.** Jira's ADF format, Confluence's HTML, SQL Server's schema introspection and GitHub's pagination each need their own handling — budget time for this.
+4. **Idempotent ingestion beats smart diffing.** SHA-256 chunk IDs make full re-ingestion safe to run on a schedule without index bloat.
+5. **Citations are the product.** The LLM answer is a summary; the source link is the thing you act on. Design for citations from the start.
+
+## Try It Yourself
+
+The full source code is at [github.com/pyardley/CorporateRAG](https://github.com/pyardley/CorporateRAG).
+
+```bash
+git clone https://github.com/pyardley/CorporateRAG corporaterag
+cd corporaterag/rag-multi-source
+
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1   # Windows PowerShell
+
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Minimum required values in `.env`:
+
+```env
+PINECONE_API_KEY=pcsk_...
+OPENAI_API_KEY=sk-...
+ENCRYPTION_KEY=<generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
+APP_SECRET_KEY=any-random-string
+DATABASE_URL=sqlite:///rag_system.db
+```
+
+Then start the app:
+
+```bash
+streamlit run app/main.py
+```
+
+Open [http://localhost:8501](http://localhost:8501), create an account, enter credentials for each source in the **Credentials & Settings** sidebar and run the ingestion. Then ask it something you'd normally spend twenty minutes tracking down across four tools.
