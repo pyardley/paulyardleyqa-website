@@ -33,14 +33,14 @@ This is a practical example of AI-assisted SQL development: the agent doesn't ne
 
 The setup is the same as the previous post. Two tables - `CustomerOriginal` (the baseline) and `Customer` (the current state) - share an identical schema:
 
-| Column | Type |
-|--------|------|
-| CustomerID | int (identity, PK) |
-| Forename | nvarchar |
-| Surname | nvarchar |
-| UpdatedDateTime | datetime2 |
-| AddressLine1 | nvarchar |
-| AddressLine2 | nvarchar |
+| Column          | Type               |
+| --------------- | ------------------ |
+| CustomerID      | int (identity, PK) |
+| Forename        | nvarchar           |
+| Surname         | nvarchar           |
+| UpdatedDateTime | datetime2          |
+| AddressLine1    | nvarchar           |
+| AddressLine2    | nvarchar           |
 
 The current `Customer` table has three differences from the original: a deleted row, a modified row and a new row.
 
@@ -89,11 +89,11 @@ ROLLBACK TRAN;
 
 And this is the output it produces:
 
-| ChangeType | CustomerID | Old_Forename | New_Forename | Old_Surname | New_Surname | Old_Addr1 | New_Addr1 | Old_Addr2 | New_Addr2 |
-|------------|-----------|--------------|--------------|-------------|-------------|-----------|-----------|-----------|-----------|
-| DELETE | 1 | John | NULL | Doe | NULL | 123 London Road | NULL | Apt 4B | NULL |
-| UPDATE | 2 | Jane | Jane | Smith | Smith-London | 45 High Street | 45 High Street | NULL | Top Floor Flat |
-| INSERT | 5 | NULL | Robert | NULL | Tables | NULL | 10 Downing Street | NULL | SW1A 2AA |
+| ChangeType | CustomerID | Old_Forename | New_Forename | Old_Surname | New_Surname  | Old_Addr1       | New_Addr1         | Old_Addr2 | New_Addr2      |
+| ---------- | ---------- | ------------ | ------------ | ----------- | ------------ | --------------- | ----------------- | --------- | -------------- |
+| DELETE     | 1          | John         | NULL         | Doe         | NULL         | 123 London Road | NULL              | Apt 4B    | NULL           |
+| UPDATE     | 2          | Jane         | Jane         | Smith       | Smith-London | 45 High Street  | 45 High Street    | NULL      | Top Floor Flat |
+| INSERT     | 5          | NULL         | Robert       | NULL        | Tables       | NULL            | 10 Downing Street | NULL      | SW1A 2AA       |
 
 Three rows, one per change - with the change type and old/new values side by side. Let's break down how this works.
 
@@ -171,15 +171,15 @@ The entire `MERGE` is wrapped in a transaction that is immediately rolled back. 
 
 In the [previous post](/blog/sql-except-table-differences), the `EXCEPT` approach used two CTEs and four `UNION ALL` branches with joins to classify changes. Here's how the two approaches compare:
 
-| Aspect | EXCEPT + CTEs | MERGE + OUTPUT |
-|--------|--------------|----------------|
-| **Table scans** | Two full scans per CTE (four total) | Single join |
-| **Change classification** | Manual via joins and NULL checks | Automatic via `$action` |
-| **Old and new values** | Separate rows (CHANGED FROM / CHANGED TO) | Side-by-side columns in one row |
-| **Column enumeration** | None needed (`SELECT *`) | Required for `ISNULL` checks and INSERT |
-| **NULL handling** | Automatic (EXCEPT treats NULLs as equal) | Manual (`ISNULL` wrappers needed) |
-| **Readability** | More intuitive for SQL beginners | More compact but requires MERGE knowledge |
-| **Schema changes** | No query changes needed | Must update column lists |
+| Aspect                    | EXCEPT + CTEs                             | MERGE + OUTPUT                            |
+| ------------------------- | ----------------------------------------- | ----------------------------------------- |
+| **Table scans**           | Two full scans per CTE (four total)       | Single join                               |
+| **Change classification** | Manual via joins and NULL checks          | Automatic via `$action`                   |
+| **Old and new values**    | Separate rows (CHANGED FROM / CHANGED TO) | Side-by-side columns in one row           |
+| **Column enumeration**    | None needed (`SELECT *`)                  | Required for `ISNULL` checks and INSERT   |
+| **NULL handling**         | Automatic (EXCEPT treats NULLs as equal)  | Manual (`ISNULL` wrappers needed)         |
+| **Readability**           | More intuitive for SQL beginners          | More compact but requires MERGE knowledge |
+| **Schema changes**        | No query changes needed                   | Must update column lists                  |
 
 The `EXCEPT` approach wins on simplicity and schema independence - you don't need to name columns at all. The `MERGE` approach wins on efficiency and output format - one pass, one row per change, old and new values side by side.
 
