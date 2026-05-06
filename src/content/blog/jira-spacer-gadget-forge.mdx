@@ -12,18 +12,16 @@ Jira dashboards are great - until you try to use them as a wallboard. The moment
 
 ## The Problem: Two-Column Wallboards Don't Align
 
-The dashboard we use is a two-column layout with **Rich Text** section headers above groups of related gadgets. On a single column it looks fine. On a wallboard with two columns of differing content heights, the rows quickly fall out of sync — the left column's "Releases" header sits next to the right column's "Open Bugs" gadget, and so on all the way down.
+The dashboard we use is a two-column layout with **Rich Text** section headers above groups of related gadgets. On a single column it looks fine. On a wallboard with two columns of differing content heights, the rows quickly fall out of sync and the only way to fix it is with the built-in Wallboard Spacer Gadget. This is far from ideal as the Wallboard Spacer Gadget has a fixed height and is visually unappealing.
 
 ![Two-column dashboard with misaligned section headers and gadgets](/blog/TwoColWithWallboard.png)
-_The wallboard view: the left and right columns start aligned at the top, but every height difference compounds as you scroll._
-
 ![Misalignment getting worse further down the dashboard](/blog/TwoColWithWallboard2.png)
-_By the middle of the dashboard the section headers no longer match the content beside them._
+_By the middle of the dashboard we have to include multiple Wallboard Spacer Gadgets to fill the space before we reach the "Workload" section of the dashboard._
 
 ![Headers and gadgets completely out of sync at the bottom](/blog/TwoColWithWallboard3.png)
-_Bottom of the dashboard — the two columns are visually telling two different stories._
+_Bottom of the dashboard - we're back in synch but only because we've used Wallboard Spacer Gadgets which are an eyesore and lack fine grain control of spacing._
 
-Jira's built-in gadget chrome doesn't help: each gadget is a fixed block with a title bar, and Rich Text headers are a different size again. Without a way to inject vertical whitespace into the shorter column, there is simply no way to keep the rows in step.
+Jira's built-in spacer gadget doesn't help much: each gadget is a fixed block with a title bar, and Rich Text headers are a different size again. Without a way to inject vertical whitespace into the shorter column, there is simply no way to keep the rows in step.
 
 ## The Better (Paid) Solution
 
@@ -44,13 +42,10 @@ That's where the Spacer Gadget comes in.
 The idea is deliberately simple: a Jira dashboard gadget that renders **nothing visible** except a configurable amount of vertical whitespace. Drop one above or below a section header in the shorter column, set the height in pixels, and the rows line up again.
 
 ![Two-column dashboard with Spacer Gadgets installed and configured](/blog/TwoColDashboardSpacers.png)
-_Same dashboard, with Spacer Gadgets pushing the right column down to match the left._
-
 ![Spacers correcting alignment further down the dashboard](/blog/TwoColDashboardSpacers2.png)
-_Section headers now sit next to the gadgets they describe, all the way down the page._
-
 ![Bottom of the dashboard with rows perfectly aligned](/blog/TwoColDashboardSpacers3.png)
-_The bottom of the wallboard — both columns finish together, and the visual story reads cleanly across the screen._
+_Same dashboard, with Spacer Gadgets pushing the right column down to match the left._
+_Section headers now sit above the gadgets they describe and the visual story reads cleanly down the screen._
 
 The whole gadget is a few dozen lines of React using Forge's [UI Kit](https://developer.atlassian.com/platform/forge/ui-kit/).
 
