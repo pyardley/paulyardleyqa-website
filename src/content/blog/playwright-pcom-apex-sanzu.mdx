@@ -20,7 +20,7 @@ draft: false
 
 Testing Oracle APEX applications with Playwright is harder than it should be. APEX generates dynamic element IDs at runtime, fires AJAX partial page refreshes after almost every interaction, and uses ARIA roles that don't map cleanly to what you'd expect from a standard web app. A test that works today breaks tomorrow when APEX regenerates a page and changes a selector.
 
-My previous post covered using Playwright's AI agents against a simple Todo app. This time I wanted to push them against something real: a live Oracle APEX e-commerce portal called **Sanzu**, running in Oracle Cloud. The goal wasn't just to produce passing tests - it was to produce tests that _stay_ passing when APEX does what APEX does.
+My previous post covered using Playwright's AI agents against a simple Todo app. This time I wanted to push them against something real: a demo Oracle APEX e-commerce portal called **Sanzu**, running in Oracle Cloud. The goal wasn't just to produce passing tests - it was to produce tests that _stay_ passing when APEX does what APEX does.
 
 The answer turned out to be a combination of two things: a **Page Component Object Model (PCOM)** that insulates every test from the raw DOM, and the **Playwright AI agent pipeline** - planner, generator, healer - driven through **Claude Code** to build the whole thing.
 
