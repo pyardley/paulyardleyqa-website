@@ -34,3 +34,6 @@ tests/k6/results/
 tests/cypress/screenshots/
 tests/cypress/videos/
 tests/cypress/downloads/
+
+# Claude Code
+.claude/
