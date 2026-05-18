@@ -1,0 +1,399 @@
+---
+title: "Building a Multi-Agent Company Research Tool for Job Interview Preparation"
+description: "How I built a six-agent CrewAI pipeline that researches any company from a URL and produces a 9-section interview preparation report — covering business model, tech stack, competitors, culture, and a tailored interview guide with specific questions to ask."
+pubDate: 2026-05-18
+author: "Paul Yardley"
+tags:
+  [
+    "AI Agents",
+    "CrewAI",
+    "LiteLLM",
+    "xAI Grok",
+    "Firecrawl",
+    "Interview Prep",
+    "Python",
+    "Multi-Agent Systems",
+    "Job Search",
+  ]
+readingTime: "15 min read"
+draft: false
+---
+
+Walking into a job interview unprepared is a particular kind of avoidable failure. The information you need is almost always publicly available — on the company's website, in recent news, in job postings that signal tech stack and team priorities, in competitor comparisons and Glassdoor threads. The problem isn't access to information. It's that assembling it all takes three to four hours of disciplined research, and most candidates either skip it or do it superficially.
+
+I wanted to automate that research. Not to produce generic interview tips, but to do the actual work: scrape the company website, pull recent news, map the competitive landscape, synthesise the strategic picture, and then turn all of that into specific, usable preparation material. Something that could answer "What should I say when they ask why I want to work here?" with answers drawn from real research, not platitudes.
+
+The result is **Company Intelligence** — a six-agent CrewAI pipeline that accepts any company URL and a target role, runs for 15-20 minutes, and produces a structured 9-section HTML report ready to read the night before an interview.
+
+## The Core Problem with Interview Prep
+
+Generic preparation produces generic impressions. Every interview coaching article tells candidates to "research the company," but the advice usually stops there — or retreats to "visit their website and LinkedIn page." That's table stakes. The candidates who stand out know that the company recently pivoted its go-to-market, that their main competitor just raised a Series C, that their engineering blog mentions a migration from monolith to microservices still in progress, or that three senior engineers left in the last six months for the same competitor.
+
+That level of specificity takes time — and it's exactly the kind of information retrieval, synthesis, and reframing task where a well-prompted multi-agent system has a genuine advantage.
+
+## The Architecture: Six Agents in Sequence
+
+The pipeline uses CrewAI's sequential `Process`, where each task receives the outputs of previous tasks as context. There's no parallelism — the analyst can't synthesise until the researcher has finished; the interview specialist can't advise until the analyst has assessed the strategic picture.
+
+```
+Company URL + Target Role
+         │
+    [Task 1] Company Researcher        → company profile JSON
+         │
+    [Task 2] Market Intelligence       → competitive landscape + news
+         │
+    [Task 3] Strategic Analyst         → synthesis + employer signals
+         │
+    [Task 4] Interview Specialist      → why this company, questions, cheat sheet
+         │
+    [Task 5] Report Writer             → 9-section HTML + embedded Markdown
+         │
+    [Task 6] QA Reviewer (optional)    → citation check + specificity audit
+```
+
+The sequential design matters here. A common failure mode in multi-agent research is each agent making the same web searches independently. By chaining task context, the analyst is explicitly instructed _not_ to search for new information — only to synthesise what Tasks 1 and 2 found. The interview specialist's prompt similarly prohibits new research. This prevents redundant API calls and keeps the pipeline focused.
+
+The whole thing is assembled in `CompanyResearchCrew`:
+
+```python
+crew = CompanyResearchCrew(
+    company_url="https://www.company.com",
+    target_role="Senior Product Manager",
+    user_context="Focus on tech stack and engineering culture",
+)
+result = crew.run()
+
+html     = result["html"]       # full report for viewing or emailing
+markdown = result["markdown"]   # condensed version for phone reading
+```
+
+## The Agents
+
+### Agent 1: Company Researcher
+
+The first agent is a Senior Company Intelligence Analyst with a 7-step research protocol baked into its backstory. It isn't told to "look up the company" — it's given a systematic sequence:
+
+1. Scrape the homepage (value proposition, key messages, product names)
+2. Scrape `/about`, `/company`, `/mission`, `/story`
+3. Scrape `/products`, `/services`, `/platform`, `/solutions`
+4. Scrape `/team`, `/leadership`, `/executive`
+5. Scrape `/careers` — job ads reveal tech stack, growth areas, and culture language
+6. Scrape `/blog`, `/engineering`, `/press`
+7. Search externally for funding, headcount, and recent news (Crunchbase, LinkedIn, press)
+
+The `/careers` step is the most valuable one most candidates skip. Job postings are a goldmine: if three of the five backend engineer roles require Rust but the website talks only about Python, the company is making a language migration they haven't announced yet. If they're hiring aggressively in sales but not engineering, they're shifting from a product-led to a sales-led motion. The agent is explicitly briefed to read these signals.
+
+Expected output is structured JSON — company name, business model, products, size estimate with evidence, leadership, tech stack, current initiatives, culture signals, and data gaps. Structured output from this agent makes everything downstream more reliable.
+
+```python
+Agent(
+    role="Senior Company Intelligence Analyst",
+    goal=(
+        "Comprehensively research the target company's website and external sources "
+        "to build a complete profile for job interview preparation. "
+        "Every claim must have a source URL. "
+        "Distinguish between stated facts and inferred signals."
+    ),
+    tools=[FirecrawlSearchTool(), FirecrawlScrapeTool()],
+    max_iter=10,
+)
+```
+
+### Agent 2: Market Intelligence Researcher
+
+The second agent focuses on context the company itself won't provide: competitors, industry trends, and risk signals. It's given six explicit search areas:
+
+- Recent news (last 3-6 months, 2025-prioritised)
+- Competitive landscape (3-5 named competitors with differentiation analysis)
+- Industry macro trends affecting the company
+- Social and sentiment signals (X/Twitter, Glassdoor, Reddit)
+- **Risk signals** — layoffs, controversy, lawsuits, pivots, funding cuts
+- Positive signals — awards, growth, customer wins, expansion
+
+The risk signals category is worth emphasising. Most candidates only look for positive information, which leaves them blindsided when an interviewer probes a known problem. An agent briefed to explicitly search `"[company] layoffs"`, `"[company] problems"`, and `"[company] controversy"` finds what a casual search misses — and converts it into interview preparation material: _"I noticed X — how are you addressing that?"_ is a confident question; being visibly surprised by it is not.
+
+### Agent 3: Strategic Analyst
+
+The analyst sees everything Tasks 1 and 2 gathered and is explicitly prohibited from doing additional research. Its job is synthesis across six dimensions:
+
+1. **Competitive position** — primary advantage, durability, biggest credible threat
+2. **Growth trajectory** — assessment (growing / stable / uncertain / declining) with confidence level and supporting evidence
+3. **Strategic challenges** — top 3, with severity and time horizon
+4. **Strategic opportunities** — top 3, with company readiness assessment
+5. **Employer signals** — honest synthesis of what it's probably like to work there
+6. **Interview intelligence** — given the role, what kind of candidate are they prioritising?
+
+The "interview intelligence" section is where the analyst earns its keep. A company hiring a senior engineer to lead a migration off a legacy platform wants someone with migration experience and the patience to work in a constrained codebase. A Series A startup wants someone comfortable with ambiguity and happy to wear multiple hats. These signals are in the research data — but they need synthesis to surface them clearly.
+
+### Agent 4: Interview Preparation Specialist
+
+This is the agent with no v1.0 equivalent — new for the interview-prep use case. Its core instruction:
+
+> _"Generic preparation produces generic impressions. Every piece of advice you give should be so specific to this company that it could only have been written after genuinely researching them."_
+
+The agent produces four deliverables:
+
+**Why This Company? (3 reasons)** — Each reason must reference something concrete: a specific product feature, a market bet the company is making, a strategic initiative, a values signal from their about page or engineering blog. The backstory gives the agent an explicit framework: `[specific thing that interests you] + [why it connects to your background] + [what you'd bring to it]`. Banned phrases: "great culture", "exciting opportunity", "industry leader".
+
+**Smart Questions to Ask (8-10 questions)** — Questions that show research. The agent categorises them: 2-3 strategic questions (company direction, market bets), 2-3 team and product questions, 1-2 culture questions, 1-2 role-specific questions. Each question is returned with the specific research finding that inspired it — so candidates know why the question is a good one.
+
+**Potential Challenges to Address (3-5 items)** — What might the interviewer probe, based on risk signals and role fit? Each item comes with a suggested approach: honest enough to show maturity, prepared enough to show competence.
+
+**Day-of Cheat Sheet** — Five facts to know cold: company in one sentence, key product name, one recent news event worth mentioning, CEO or founder name, one differentiator from the main competitor.
+
+### Agent 5: Report Writer
+
+The writer takes structured outputs from all four preceding tasks and produces a polished HTML document. Its HTML design guidelines are specific enough to produce a consistent, professional result:
+
+- Colour palette: `#1e3a5f` (dark navy), `#2563eb` (accent blue), `#f8fafc` (page background)
+- Max-width 900px, centred, section cards with box-shadow and 8px border-radius
+- Section 8 (Interview Guide) gets a visually distinct `#eff6ff` background with a blue left border — so candidates can jump straight to the actionable content
+- Impact badges: green pills for positive signals, red for risks
+- Inline citations `[1]`, `[2]`... linked to a sources section
+
+After the HTML closing tag, the writer embeds a condensed Markdown version in an HTML comment block:
+
+```html
+<!-- MARKDOWN_START -->
+# Company Name — Interview Prep
+**Role:** Senior Engineer | **Date:** 2026-05-18
+
+## Quick Facts
+| Field     | Detail          |
+|-----------|-----------------|
+| Business  | SaaS / B2B      |
+| Stage     | Series B        |
+| Size      | ~200 employees  |
+| HQ        | London, UK      |
+
+## Interview Guide
+### Why This Company?
+1. ...
+<!-- MARKDOWN_END -->
+```
+
+The Markdown version exists for one purpose: to be readable on a phone in the car park before walking in. The `_extract_markdown()` method in `CompanyResearchCrew` pulls it out of the HTML comment at runtime and returns it as a separate field in the result dict.
+
+### Agent 6: QA Reviewer (Optional)
+
+The final agent audits the report against a six-point checklist: source integrity (every factual claim cited), specificity (no generic advice), completeness (all 9 sections present, ≥6 questions to ask, cheat sheet fully populated), accuracy (no hallucinated facts), HTML quality (valid markup, no placeholders), and readability. Critically — it doesn't report issues, it fixes them inline and returns the corrected document. Skip it with `--no-review` to save tokens during development.
+
+## The Nine-Section Report
+
+The report follows a fixed structure designed to take a candidate from knowing nothing about a company to walking in confident:
+
+```
+1. Header              — company, role, date
+2. Executive Summary   — 3-4 sentences: what they do, their stage, one key insight
+3. Company Overview    — business model, products, size, growth, HQ, founding date
+4. Technology Stack    — confirmed and inferred stack, current tech initiatives
+5. Market Position     — 3-5 competitors with differentiation, competitive moat
+6. Culture & Values    — stated values, work style, Glassdoor signals, perks/concerns
+7. Recent News         — last 3-6 months, notable developments to mention
+8. Interview Guide     — why this company, smart questions, challenges, cheat sheet
+9. Sources             — numbered URL list for all citations
+```
+
+Sections 1-7 inform; section 8 is where the candidate does something with that information. The visual separation (the `#eff6ff` blue-tinted background, the left border accent) isn't decoration — it signals "this is the part you act on."
+
+## The CLI
+
+The entry point is a Click CLI with ten options on the `research` command:
+
+```powershell
+python main.py research `
+  --url https://www.company.com `
+  --role "Senior Product Manager" `
+  --context "focus on engineering culture and tech stack" `
+  --format both `
+  --email `
+  --no-review
+```
+
+The `--format both` flag saves both HTML and Markdown versions to disk. `--email` sends the HTML report via Gmail immediately after generation — useful for researching a company in the evening and having the report in your inbox for morning commute reading. `--dry-run` validates all API keys and configuration without making any LLM calls, useful before a run that costs real money.
+
+The tool also has utility commands:
+
+```powershell
+python main.py check-config      # verify all API keys are present
+python main.py init-db           # create the pgvector table (only needed with --use-db)
+python main.py authorize-gmail   # OAuth2 flow for Gmail sending
+python main.py cost-report       # print token usage and cost for recent runs
+```
+
+The `cost-report` command reads from a JSONL cost log that tracks token usage per run — useful for understanding what a research run actually costs before committing to a workflow that runs it regularly.
+
+## The Technology Stack
+
+### CrewAI
+
+CrewAI provides the agent orchestration layer: the `Agent` class (with role, goal, backstory, tools, and LLM), the `Task` class (with description, expected output, agent, and `context=[prior_tasks]` for chaining), and the `Crew` class that assembles them into a `Process.sequential` pipeline. The context chaining is the key feature — `context=[task1, task2]` on a task causes CrewAI to inject those tasks' outputs into the executing agent's context window automatically.
+
+### LiteLLM + xAI Grok
+
+All agents go through LiteLLM, which provides a unified API across providers. The default is xAI's Grok, accessed via the `xai/grok-beta` model string. Switching to Claude or GPT-4o requires one `.env` change:
+
+```bash
+LLM_PROVIDER=anthropic
+ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+One practical wrinkle: xAI's Grok rejects the `stop` parameter that LiteLLM sends by default. The settings module patches LiteLLM's `completion` function at startup to strip `stop` from any call routed to an `xai/` model:
+
+```python
+def _patch_litellm_for_xai():
+    import litellm
+    _orig = litellm.completion
+
+    def _patched(*args, **kwargs):
+        model = kwargs.get("model", args[0] if args else "")
+        if isinstance(model, str) and "xai/" in model:
+            kwargs.pop("stop", None)
+        return _orig(*args, **kwargs)
+
+    litellm.completion = _patched
+```
+
+This pattern — monkey-patching a library's core function to handle an undocumented provider quirk — is the kind of thing that doesn't appear in any README but is essential for the tool to actually work.
+
+### Firecrawl
+
+Web scraping uses Firecrawl's Python SDK v4. Two tools are exposed to the agents via custom `BaseTool` wrappers:
+
+- `FirecrawlSearchTool` — wraps `app.search(query)`, returns `result.data[].web` fields
+- `FirecrawlScrapeTool` — wraps `app.scrape_url(url)`, returns `result.markdown`
+
+Firecrawl handles JavaScript rendering, so the agents can scrape SPAs and dynamically-rendered pages that a raw `requests` call would return as empty HTML. The markdown output format is particularly well-suited to feeding LLMs — it strips navigation, footers, and sidebar noise and returns the main content as clean structured text.
+
+### Tweepy
+
+Social sentiment from X/Twitter comes via Tweepy v2 with Bearer Token authentication. The Twitter tool wraps `client.search_recent_tweets()` and formats results as a text block the agent can analyse. The tool degrades gracefully when the Bearer Token isn't configured — returning an empty result rather than raising an exception, so the pipeline completes without social data rather than failing entirely.
+
+### PostgreSQL + pgvector (Optional)
+
+The `--use-db` flag enables storing research chunks as vector embeddings in a PostgreSQL database with the pgvector extension. In practice, this is mostly useful for the optional scheduler (for recurring research runs) or if you want to build a searchable archive of past research. The default in-memory fallback uses numpy cosine similarity:
+
+```python
+def search(self, query_embedding: list[float], top_k: int = 5) -> list[dict]:
+    if not self._chunks:
+        return []
+    query_vec = np.array(query_embedding)
+    similarities = [
+        (i, float(np.dot(query_vec, np.array(c["embedding"])) /
+            (np.linalg.norm(query_vec) * np.linalg.norm(c["embedding"]) + 1e-10)))
+        for i, c in enumerate(self._chunks)
+    ]
+    top = sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
+    return [self._chunks[i] for i, _ in top]
+```
+
+For a single on-demand run, the in-memory store is perfectly adequate. The numpy fallback means the tool works out-of-the-box without any database setup.
+
+### Click + Rich
+
+Click handles the CLI surface. Rich provides the styled terminal output — the panel showing URL, role, and format at startup; the progress indicators; the cost summary table at the end. The combination makes the tool feel polished rather than like a development script.
+
+## Suggestions for Future Enhancements
+
+### Resume Matching
+
+The most natural next capability: feed in a CV alongside the company URL and role, and have the Interview Specialist generate a fit analysis — where the candidate's background maps well onto the company's stated priorities, and where there are gaps to acknowledge or bridge. The `user_context` field already provides a hook for this; a proper implementation would add a `--resume` flag that reads a PDF or text file and injects its content into the analyst and interview specialist tasks.
+
+### Side-by-Side Company Comparison
+
+When choosing between offers or deciding which of several companies to prioritise, a comparison mode would be valuable: run the pipeline for two or three URLs and produce a structured comparison report. The architecture already supports this — it would be a new `compare` CLI command that runs `CompanyResearchCrew` for each URL and passes all results to a new comparison agent.
+
+### Salary Intelligence
+
+Adding a dedicated salary research agent (Levels.fyi scraping, Glassdoor salary data, recent job postings with salary ranges) would make the report more complete. Role-specific compensation context is highly relevant interview preparation material — knowing whether to negotiate, and by how much, before walking in.
+
+### Interview Question Practice Mode
+
+A conversational follow-up mode: after the report is generated, the tool could enter a Q&A session where it generates likely interview questions based on the role and company profile and critiques the user's responses. This would require a stateful conversation loop rather than a one-shot pipeline, but the research data from the existing run provides the context needed to generate company-specific questions rather than generic ones.
+
+### Persistent Cross-Run Memory
+
+The current v2.0 design is intentionally per-run only — no cross-run trend detection. For users who research the same company repeatedly (tracking a target employer over several months), enabling the pgvector store between runs and adding a "what's changed since last time?" section to the report would be genuinely useful.
+
+### Web UI
+
+A lightweight Streamlit or Gradio front end would make the tool accessible to non-technical users — a URL input, role field, and a "Research" button, with a streaming progress view as agents complete their tasks and a rendered report at the end. The `CompanyResearchCrew.run()` interface is clean enough to wrap without architectural changes.
+
+### Email Scheduling
+
+The `scheduler/weekly_scheduler.py` module already exists for recurring runs. Wrapping it in a simple web interface — "research this company every Monday at 8am and email me the report" — would make it useful for ongoing monitoring of target employers.
+
+## Alternative Tech Stacks
+
+### LangGraph Instead of CrewAI
+
+LangGraph (from the LangChain ecosystem) offers a graph-based agent orchestration model that would handle this pipeline's sequential structure equally well, with better built-in support for streaming intermediate outputs — useful if you want to show the user what each agent found as it happens rather than waiting for the full run. The tradeoff is more verbose setup: LangGraph requires explicit node and edge definitions where CrewAI's `context=[task]` chaining does the same thing more concisely. For a pipeline this linear, CrewAI's simplicity wins; for something with conditional branching (skip the market intel step if it's a very early-stage startup with no competitors worth analysing), LangGraph's graph model would be cleaner.
+
+### AutoGen Instead of CrewAI
+
+Microsoft's AutoGen uses a conversation-based multi-agent model — agents talk to each other directly rather than passing structured task outputs through an orchestrator. This works better for exploratory or open-ended research where the agents need to negotiate what to investigate next. For a structured pipeline with well-defined sequential tasks and expected JSON outputs, AutoGen's conversational overhead adds complexity without benefit. Worth reconsidering if the interview preparation workflow ever needs more dynamic agent coordination.
+
+### Perplexity API Instead of Firecrawl
+
+Perplexity's API combines search and synthesis in a single call — ask it a question and it returns a cited answer drawn from recent web content. This would simplify the Market Intelligence agent significantly: instead of running separate searches, scraping pages, and asking the LLM to synthesise, a single Perplexity API call per research question returns cited summaries ready for the agent to reason about. The tradeoff is less control over what gets scraped (you can't tell it to specifically go to `/engineering/blog`), and the scraping depth of the Company Researcher's 7-step protocol would be harder to replicate.
+
+### Brave Search API Instead of Firecrawl for Search
+
+Firecrawl is used for both search and scraping. For the search component specifically, Brave's Search API provides web search with real-time results and no rate limiting concerns, at lower cost than Firecrawl's search endpoint. Keeping Firecrawl for page scraping (where its JavaScript rendering matters) while using Brave for search queries would reduce costs on high-volume research runs.
+
+### ChromaDB Instead of pgvector
+
+ChromaDB is already installed as a transitive dependency (via CrewAI's dependency chain). For the in-run vector store, replacing the numpy cosine similarity fallback with ChromaDB's in-memory mode would give a proper embedding store without needing PostgreSQL — easier to set up, better performance on larger result sets, and no infrastructure to manage. For persistent storage across runs, pgvector remains the better choice if you already have a Postgres instance; ChromaDB's persistent mode is an alternative for users who don't.
+
+### FastAPI + React Instead of CLI
+
+The Click CLI is the right interface for a tool built and used by a developer. A FastAPI backend exposing a `/research` endpoint, with a React or Next.js front end, would open the tool to a wider audience — HR teams, recruiters, career coaches. The pipeline's `run()` method is already a clean async-friendly interface; the main work would be adding SSE (server-sent events) for streaming agent progress updates to the browser.
+
+### Anthropic Claude Instead of xAI Grok
+
+The LLM provider is already abstracted behind LiteLLM, so switching is a one-line `.env` change. From a quality standpoint, Claude Sonnet performs particularly well on the report writing and interview specialist tasks — its instruction-following accuracy and structured output reliability are strong. The cost profile is different (Grok is cheaper per token), but for a tool that runs once before each interview, cost per run matters less than output quality.
+
+## Key Takeaways
+
+1. **Task context chaining is the key architectural decision** — by explicitly passing prior task outputs as context, each subsequent agent builds on real research rather than repeating searches. The analyst synthesises rather than re-searches; the interview specialist advises rather than investigates. This keeps the pipeline focused and prevents redundant API calls.
+
+2. **The interview specialist's "no generic advice" constraint is what makes the output useful** — without the explicit prohibition on generic tips, a well-prompted LLM will produce competent but useless boilerplate. The constraint that every piece of advice must be traceable to a specific research finding forces specificity.
+
+3. **Job postings are the most underrated research source** — the Company Researcher's explicit step to scrape careers pages and interpret job ad language produces insights (tech stack migrations, hiring priorities, culture signals) that are invisible on the marketing-facing website.
+
+4. **Dual HTML + Markdown output solves a real UX problem** — the full HTML report is for evening preparation; the condensed Markdown is for the car park. Embedding the Markdown in an HTML comment and extracting it at runtime is a slightly unusual pattern, but it means the report writer produces both formats in a single pass without needing a separate agent or an additional LLM call.
+
+5. **Make optional dependencies actually optional** — the pgvector fallback to numpy, the Twitter graceful degradation, the Gmail optional flag. A tool that fails at startup because one of five optional integrations isn't configured is a tool that gets abandoned. Sensible defaults and graceful degradation mean the core workflow always works.
+
+6. **Provider abstraction via LiteLLM pays for itself immediately** — the xAI Grok `stop` parameter patch is the kind of provider-specific quirk you discover the hard way. Centralising all LLM calls in one factory function (`get_llm()`) means the patch applies everywhere and switching providers to debug a problem is one `.env` change.
+
+## Try It Yourself
+
+The full project is on GitHub: [github.com/pyardley/CompanyIntelligence](https://github.com/pyardley/CompanyIntelligence)
+
+```powershell
+git clone https://github.com/pyardley/CompanyIntelligence.git
+cd CompanyIntelligence
+
+# Create a Python 3.12 virtual environment (3.12 required — pydantic-core
+# wheels for 3.13+ are not yet available for all dependencies)
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+# Copy the example env file and add your API keys
+Copy-Item .env.example .env
+# Edit .env: set XAI_API_KEY and FIRECRAWL_API_KEY at minimum
+
+# Verify configuration
+python main.py check-config
+
+# Run your first research job
+python main.py research --url https://www.company.com --role "Your Target Role"
+
+# For a faster run during testing (skip the QA reviewer pass)
+python main.py research --url https://www.company.com --no-review
+```
+
+The minimum viable setup requires two API keys: an xAI key for the LLM (or set `LLM_PROVIDER=anthropic` / `LLM_PROVIDER=openai` and the corresponding key) and a Firecrawl key for web scraping. Twitter, Gmail, and PostgreSQL are all optional — the pipeline runs cleanly without any of them.
+
+A typical run for a mid-sized company with a decent web presence and some press coverage takes 12-18 minutes and produces a 60-90KB HTML report covering all nine sections. The cost depends heavily on the LLM provider and how much content the agents scrape — on xAI Grok, most runs land under $0.50.
