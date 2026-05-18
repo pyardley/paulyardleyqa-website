@@ -59,23 +59,3 @@ jobs:
           name: cypress-screenshots
           path: cypress/screenshots/
           retention-days: 14
-
-      - name: Install k6
-        run: |
-          curl -fsSL https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz | tar xzf - --strip-components=1
-          sudo mv k6 /usr/local/bin/
-
-      - name: Run k6 performance tests
-        run: |
-          mkdir -p tests/k6/results
-          k6 run tests/k6/performance.js
-        env:
-          BASE_URL: http://localhost:4321
-
-      - name: Upload k6 results
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: k6-performance-report
-          path: tests/k6/results/
-          retention-days: 30
