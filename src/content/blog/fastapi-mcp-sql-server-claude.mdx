@@ -1,0 +1,515 @@
+---
+title: "Connecting Claude to a SQL Server Database with FastAPI and the Model Context Protocol"
+description: "A walkthrough of a two-layer demo project that exposes a SQL Server database to Claude via a FastAPI REST API and an MCP stdio server — covering what each file does, where the API ends and the MCP begins, and what a production-ready version of this stack would look like."
+pubDate: 2026-05-19
+author: "Paul Yardley"
+tags:
+  [
+    "MCP",
+    "Model Context Protocol",
+    "FastAPI",
+    "SQL Server",
+    "Claude",
+    "Anthropic",
+    "Python",
+    "Claude Desktop",
+    "Claude Code",
+    "Tool Use",
+  ]
+readingTime: "14 min read"
+draft: false
+---
+
+The Model Context Protocol is one of those ideas that sounds more complicated than it is. Strip away the spec language and it comes down to this: a standard way for an AI assistant to discover and call tools that live outside its context window. Instead of every team writing their own bespoke tool-calling integration, MCP gives you a protocol — and Claude, Claude Desktop, and Claude Code all speak it natively.
+
+This project builds the simplest possible end-to-end example: a SQL Server database exposed to Claude through a FastAPI REST layer, wrapped in an MCP server. Ask Claude "show me details for customer 3" and it calls a real database and returns live data. The architecture is intentionally minimal — no frameworks, no abstractions beyond what the task requires — which makes it useful for understanding exactly what MCP does and doesn't do.
+
+There are two distinct layers here, and keeping them clearly separate is the main point of the exercise.
+
+## The Architecture
+
+```
+Claude (Claude Code / Claude Desktop / API)
+        │  natural language
+        ▼
+  MCP (stdio transport)
+        │  JSON-RPC 2.0 — tools/call → get_customer_details
+        ▼
+  mcp_server.py  →  mcp_tool.py
+        │  HTTP GET /customer/{id}
+        ▼
+  FastAPI  (main.py)
+        │  parameterised SQL query
+        ▼
+  SQL Server (CustomerDemo / dbo.Customer)
+```
+
+The split is deliberate. The FastAPI layer is a conventional REST API — it knows nothing about MCP, Claude, or tool schemas. It just exposes a `/customer/{id}` endpoint that returns JSON. The MCP layer sits on top of it and handles the protocol work: announcing available tools to Claude, receiving JSON-RPC calls, and translating them into HTTP requests to the API.
+
+This separation means the API is independently useful. You can call it from Postman, from a React app, from a test suite, or from another service — the MCP server is just one more client. In a real project this matters a great deal: you're not coupling your data layer to the AI integration layer.
+
+## The API Layer
+
+Three files make up the API: `models.py`, `database.py`, and `main.py`. None of them contain a single line of MCP-specific code.
+
+### `models.py`
+
+The thinnest file in the project. It defines two Pydantic models that handle request and response validation across the whole API:
+
+```python
+class Customer(BaseModel):
+    CustomerID: int = Field(..., description="Primary key")
+    Forename: Optional[str] = Field(None, description="First name")
+    Surname: Optional[str] = Field(None, description="Last name")
+    UpdatedDateTime: Optional[datetime] = Field(None, description="Last update timestamp")
+    AddressLine1: Optional[str] = Field(None, description="Address line 1")
+    AddressLine2: Optional[str] = Field(None, description="Address line 2")
+
+    model_config = {"from_attributes": True}
+
+
+class HealthResponse(BaseModel):
+    status: str
+    database: str
+    version: str
+```
+
+All fields except `CustomerID` are optional. This reflects the reality of the database schema, where `AddressLine2` can be NULL — Pydantic will serialise a `None` value cleanly rather than raising a validation error. The `from_attributes = True` config allows FastAPI to instantiate the model directly from a database row object rather than requiring a dict conversion first.
+
+### `database.py`
+
+All SQL Server interaction lives here. The design makes one deliberate choice: a new connection per request rather than a connection pool.
+
+```python
+_DATABASE_URL: str = os.environ["DATABASE_URL"]
+
+def get_connection() -> pyodbc.Connection:
+    conn = pyodbc.connect(_DATABASE_URL, autocommit=False)
+    conn.timeout = 10
+    return conn
+
+@contextmanager
+def db_cursor() -> Generator[pyodbc.Cursor, None, None]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+```
+
+Connection pooling is standard advice for web APIs, but Windows Integrated Authentication complicates it. When a pool holds a connection open, the Kerberos token it was authenticated with can expire mid-pool. The per-request approach avoids this entirely: each request opens a fresh connection with a valid token and closes it when done. For a low-concurrency demo this is perfectly adequate; for a high-traffic production service you'd need to address it differently (see the alternatives section below).
+
+The `db_cursor()` context manager handles the commit/rollback/close lifecycle in one place. Every database call in the project goes through it, so there's no risk of a forgotten `conn.close()` leaving a dangling connection.
+
+The query itself is the security-critical part:
+
+```python
+def fetch_customer(customer_id: int) -> dict | None:
+    sql = """
+        SELECT CustomerID, Forename, Surname, UpdatedDateTime, AddressLine1, AddressLine2
+        FROM dbo.Customer
+        WHERE CustomerID = ?
+    """
+    with db_cursor() as cursor:
+        cursor.execute(sql, (customer_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        columns = [col[0] for col in cursor.description]
+        return dict(zip(columns, row))
+```
+
+The `?` placeholder passes the `customer_id` as a bound parameter. The driver handles escaping; the SQL string never contains user-supplied data. The sample database includes a customer named Robert Tables — a nod to the [Little Bobby Tables](https://xkcd.com/327/) xkcd comic — specifically to verify that parameterised queries handle adversarial surnames without incident.
+
+### `main.py`
+
+The FastAPI application is twelve lines of setup and two route handlers:
+
+```python
+app = FastAPI(
+    title="CustomerDemo API",
+    docs_url="/docs" if _ENV != "production" else None,
+    redoc_url="/redoc" if _ENV != "production" else None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+```
+
+The `APP_ENV=production` check disables the Swagger and ReDoc UIs in production without requiring any code change — just an environment variable. CORS is open for local development and should be restricted before any network exposure.
+
+```python
+@app.get("/customer/{customer_id}", response_model=Customer)
+def get_customer(customer_id: int) -> Customer:
+    row = fetch_customer(customer_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+    return Customer(**row)
+```
+
+FastAPI handles the integer path parameter validation. If you pass `/customer/abc`, FastAPI returns a 422 before the route handler is ever called. If the customer doesn't exist, the handler returns 404. Any database error becomes a generic 500 — the actual exception is logged to stderr, not returned to the caller.
+
+This is the complete API. It has no knowledge of Claude, no tool schemas, no JSON-RPC. It's a plain REST service that happens to be the data source for the MCP integration.
+
+## The MCP Layer
+
+Three files make up the MCP integration: `mcp_tool.py`, `mcp_server.py`, and `.mcp.json`. These are the MCP-specific files — remove them and the API still works fine; remove the API files and the MCP server has nothing to call.
+
+### `mcp_tool.py`
+
+This file does three things: defines the tool schema, provides the Python client function that calls the API, and contains a demo of the full Claude tool-use loop. The first two are the reusable building blocks that `mcp_server.py` imports directly.
+
+**The tool schema** is a Python dict that describes `get_customer_details` in the format Claude expects:
+
+```python
+TOOL_SCHEMA: dict = {
+    "name": "get_customer_details",
+    "description": (
+        "Retrieves full customer record from the CustomerDemo database by CustomerID. "
+        "Returns CustomerID, Forename, Surname, UpdatedDateTime, AddressLine1, and AddressLine2."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "customer_id": {
+                "type": "integer",
+                "description": "The unique CustomerID to look up.",
+            }
+        },
+        "required": ["customer_id"],
+    },
+}
+```
+
+This is the same JSON object you would pass in the `tools` array of a direct Anthropic Messages API call. Claude reads the `description` field to decide when to use the tool, and uses `input_schema` to construct the correct arguments. The description matters more than it might look: if it's vague, Claude will either call the tool at the wrong time or fail to call it when it should. "Retrieves full customer record... by CustomerID" tells Claude exactly what it gets and what it needs to provide.
+
+**The Python client** wraps the API call:
+
+```python
+def get_customer_details(customer_id: int, timeout: float = 10.0) -> dict:
+    url = f"{API_BASE_URL}/customer/{customer_id}"
+    with httpx.Client(timeout=timeout) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        return response.json()
+```
+
+`API_BASE_URL` is read from the environment, defaulting to `http://localhost:8000`. This is how the MCP server knows where the FastAPI API is running — it's passed in as an env var by the host (Claude Desktop, Claude Code, or a direct invocation). The function raises on HTTP errors, which is what you want: callers should decide how to handle a 404 or 500, not have it silently swallowed here.
+
+**The demo loop** in `run_claude_demo()` is the most instructive part of the file for understanding how tool use actually works at the API level:
+
+```python
+while True:
+    response = anthropic_client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=1024,
+        tools=[TOOL_SCHEMA],
+        messages=messages,
+    )
+
+    messages.append({"role": "assistant", "content": response.content})
+
+    if response.stop_reason == "end_turn":
+        for block in response.content:
+            if block.type == "text":
+                print(f"Claude: {block.text}")
+        break
+
+    if response.stop_reason == "tool_use":
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = get_customer_details(**block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result),
+                })
+        messages.append({"role": "user", "content": tool_results})
+```
+
+The loop runs until `stop_reason == "end_turn"`. When Claude wants to call a tool, it returns `stop_reason == "tool_use"` with one or more `tool_use` blocks in its content. The loop executes each tool call, collects the results as `tool_result` content blocks, and sends them back to Claude in a new user turn. Claude then uses those results to construct its final answer.
+
+This loop is what `mcp_server.py` handles automatically when operating as an MCP server — Claude Desktop and Claude Code implement the same logic internally. The demo loop exposes the mechanics directly so you can see what's happening.
+
+### `mcp_server.py`
+
+This is the MCP server itself. It implements the Model Context Protocol over stdio transport — Claude Desktop or Claude Code launches it as a subprocess and communicates with it by writing newline-delimited JSON to its stdin and reading JSON responses from its stdout.
+
+The protocol is JSON-RPC 2.0. Every message from the host has a `method` field; every response has a matching `id`, a `result` on success, or an `error` on failure. Notifications (messages the host sends without expecting a response) have no `id`.
+
+The server handles three methods:
+
+**`initialize`** is the handshake. The host sends it when the subprocess starts; the server responds with its protocol version and capabilities:
+
+```python
+if method == "initialize":
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "customer-demo", "version": "1.0.0"},
+        },
+    }
+```
+
+`capabilities: {"tools": {}}` tells the host that this server exposes tools. If it also exposed resources or prompts it would declare those capabilities here. The protocol version string `"2024-11-05"` identifies which MCP revision the server speaks.
+
+**`tools/list`** responds to the host's request for available tools. It simply returns `TOOL_SCHEMA` wrapped in the expected response shape:
+
+```python
+if method == "tools/list":
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {"tools": [TOOL_SCHEMA]},
+    }
+```
+
+This is where `mcp_tool.py`'s `TOOL_SCHEMA` reappears. The same Python dict that describes the tool for the direct Anthropic API is also what the MCP server sends to the host. There's no duplication — `mcp_server.py` imports it directly from `mcp_tool.py`.
+
+**`tools/call`** is the method Claude invokes when it wants to use the tool. The host sends the tool name and arguments; the server executes the call and returns the result:
+
+```python
+if method == "tools/call":
+    params = request.get("params", {})
+    tool_name = params.get("name")
+    args = params.get("arguments", {})
+
+    try:
+        result = get_customer_details(**args)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(result, default=str)}],
+                "isError": False,
+            },
+        }
+    except Exception as exc:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": str(exc)}],
+                "isError": True,
+            },
+        }
+```
+
+One subtlety: errors from the tool are returned as a successful JSON-RPC response with `"isError": true` in the result, not as a JSON-RPC error. This is by design in the MCP spec — the RPC call itself succeeded (the server processed the request and produced a response); it's the _tool execution_ that failed. The host passes the error content back to Claude as a tool result, and Claude decides how to respond to the user.
+
+The transport layer is minimal:
+
+```python
+def send(obj: dict) -> None:
+    line = json.dumps(obj)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+def main() -> None:
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            request = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+            continue
+        response = handle(request)
+        if response is not None:
+            send(response)
+```
+
+One message per line, in and out. `sys.stdout.flush()` after every write is critical — without it, Python's buffering would hold responses in memory rather than sending them immediately, causing the host to hang waiting for a reply that's sitting in a buffer.
+
+Logging goes to `sys.stderr` specifically so it doesn't contaminate the stdout stream that the host reads. If you log to stdout by mistake, the host receives malformed JSON-RPC and the connection breaks.
+
+### `.mcp.json`
+
+The final piece is how Claude Code discovers the server. A `.mcp.json` file in the project root is read by Claude Code on startup:
+
+```json
+{
+  "mcpServers": {
+    "customer-demo": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["mcp_server.py"],
+      "env": {
+        "API_BASE_URL": "http://localhost:8000"
+      }
+    }
+  }
+}
+```
+
+`command` and `args` define the subprocess to launch. Using the venv's Python executable rather than the system `python` ensures the correct dependencies are available. `env` passes environment variables to the subprocess — this is how `API_BASE_URL` reaches `mcp_tool.py` at runtime without needing a `.env` file in the server process.
+
+For Claude Desktop, the equivalent configuration goes in `%APPDATA%\Claude\claude_desktop_config.json` under the same `mcpServers` key. Claude Desktop doesn't read `.mcp.json`, so the paths must be absolute there. If you prefer to use a relative path for the script, you need to add a `"cwd"` field pointing to the project directory — without it, the relative path is resolved from wherever Claude Desktop's working directory happens to be, which is unpredictable.
+
+The name `"customer-demo"` is the server identifier. Claude Code will show it as the source of available tools. Using a descriptive name matters when a project has multiple MCP servers registered.
+
+## How the Two Paths Compare
+
+Running `python mcp_tool.py "Show me details for customer 3"` and asking Claude Code the same question in the chat produce the same database query, but through fundamentally different call paths:
+
+| | Direct API (`mcp_tool.py`) | MCP Server (`mcp_server.py`) |
+|---|---|---|
+| Transport | Python function call | JSON-RPC 2.0 over stdio |
+| Tool discovery | Hardcoded in `run_claude_demo()` | `tools/list` response |
+| Orchestrator | `run_claude_demo()` loop | Claude Code / Claude Desktop |
+| Process model | In-process | Subprocess |
+| Use case | Scripts, testing, API demos | Chat interfaces, Claude Code |
+
+The direct path is simpler for development and testing. The MCP path is what enables the chat interface — Claude Code doesn't know Python or httpx; it knows MCP, and the server bridges the gap.
+
+## Production Alternatives
+
+The demo is deliberately thin. Here's what a production-ready version of each layer would look like.
+
+### Replace handcrafted JSON-RPC with the official MCP SDK
+
+The server in `mcp_server.py` implements the protocol by hand — parsing JSON, dispatching on the `method` string, constructing response dicts. This is fine for a single-tool demo, but it doesn't scale. The official [Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk) from Anthropic handles all of this:
+
+```python
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
+
+app = Server("customer-demo")
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    return [Tool(name="get_customer_details", description="...", inputSchema={...})]
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    result = get_customer_details(**arguments)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+async def main():
+    async with stdio_server() as (read, write):
+        await app.run(read, write, app.create_initialization_options())
+```
+
+The SDK handles `initialize`, `tools/list`, notifications, error codes, and protocol versioning automatically. It also supports newer protocol features — sampling, resources, prompts — that would require significant boilerplate to implement by hand. For anything beyond a demo, use the SDK.
+
+### Switch from stdio to HTTP with SSE transport
+
+Stdio transport works well for local desktop tools. For a server-side deployment — where Claude needs to call tools hosted on a remote machine — the MCP spec defines an HTTP transport using Server-Sent Events (SSE). The host connects to an HTTP endpoint; the server streams JSON-RPC responses as SSE events.
+
+The Python MCP SDK supports this directly:
+
+```python
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+
+transport = SseServerTransport("/messages")
+starlette_app = Starlette(routes=[
+    Route("/sse", endpoint=transport.handle_sse),
+    Mount("/messages", app=transport.handle_post_message),
+])
+```
+
+HTTP transport makes the MCP server deployable as a web service: containerised, behind a load balancer, with proper TLS termination. It also enables multi-client connections — a single MCP server instance handling requests from multiple Claude sessions simultaneously.
+
+### Add authentication
+
+The demo server has no authentication. Any process that can launch the subprocess or connect to the HTTP endpoint can call `tools/call`. For a production deployment:
+
+- **API key auth**: pass a secret in the `env` block of the MCP config; validate it on every `tools/call` request before executing the tool
+- **OAuth 2.0**: the MCP spec includes an OAuth flow for HTTP transport, where the host handles token acquisition and passes bearer tokens with each request
+- **mTLS**: for internal service-to-service calls, mutual TLS provides authentication without managing application-layer tokens
+
+The right choice depends on the deployment context. For an internal tool accessed only from developer machines, a shared API key in a secrets manager is usually sufficient. For a multi-tenant hosted service, OAuth is the appropriate model.
+
+### Replace pyodbc with SQLAlchemy and a connection pool
+
+The per-request connection approach in `database.py` is correct for Windows Integrated Auth but inefficient for high concurrency. SQLAlchemy's async engine with connection pooling is the standard production solution:
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+
+engine = create_async_engine(
+    "mssql+aioodbc:///?odbc_connect=...",
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+)
+```
+
+`pool_pre_ping=True` causes SQLAlchemy to test a connection with a lightweight query before handing it to a request handler, which catches stale connections in the pool before they cause errors. The async engine integrates cleanly with FastAPI's async route handlers, allowing the server to handle many concurrent requests without blocking on I/O.
+
+For Windows Integrated Auth specifically, SQLAlchemy's connection events can refresh tokens before they expire, which solves the pooling problem without falling back to per-request connections.
+
+### Make the API layer OpenAPI-first
+
+FastAPI generates an OpenAPI spec automatically from the route definitions and Pydantic models. This spec is available at `/openapi.json` while the server is running. In a production MCP integration, the tool schema in `TOOL_SCHEMA` should be derived from that OpenAPI spec rather than maintained separately — so that if the API changes, the tool description Claude sees changes automatically.
+
+There are libraries (such as `openapi-to-mcp`) that convert an OpenAPI spec into MCP tool definitions at startup. This approach eliminates the risk of the tool schema drifting out of sync with the actual API contract.
+
+### Replace FastAPI with an existing API gateway
+
+The demo builds a FastAPI app specifically to expose the database. In a real enterprise context, a database this important almost certainly already has an API in front of it — a REST or GraphQL service, an API gateway, or an OData endpoint. In that case, the MCP layer just needs to know the existing API's interface; the FastAPI layer in this project is only necessary because there isn't one already.
+
+This is the architectural pattern for most real MCP integrations: write the MCP server to call an API that already exists, not to build a new one. The tool schema describes the operation in terms Claude understands; the implementation calls whatever internal system actually has the data.
+
+### Consider the Anthropic tool use API for simpler integrations
+
+If you don't need Claude Desktop or Claude Code support — if you're building a backend system where your own code orchestrates the conversation — the direct Anthropic Messages API with the `tools` parameter may be simpler than running an MCP server at all. The `run_claude_demo()` function in `mcp_tool.py` demonstrates this: no subprocess, no JSON-RPC, just a Python function called directly.
+
+MCP adds value when you need standardised multi-tool discovery across a heterogeneous set of servers, or when you're integrating with a host application (Claude Code, Claude Desktop, or a third-party MCP client) that you don't control. For a tightly-scoped backend service where you control both sides, the direct API is often the simpler choice.
+
+## Key Takeaways
+
+1. **The API and the MCP server are genuinely separate layers** — `main.py`, `database.py`, and `models.py` have no MCP-specific code. The FastAPI service could be replaced with any HTTP API and `mcp_tool.py` would need only a URL change. This separation keeps the integration loosely coupled and the API independently testable.
+
+2. **The tool schema description is load-bearing** — `TOOL_SCHEMA`'s `description` field is what Claude reads to decide when and whether to call the tool. A vague description produces unreliable tool invocation. The description should answer: what does this tool return, what does it need, and when should Claude use it instead of answering from its own knowledge?
+
+3. **stdio transport is simple but has constraints** — one process per client, no remote deployment, no multi-session. It's the right default for local desktop integrations and the wrong default for anything that needs to scale or run server-side. The MCP SDK makes switching to HTTP+SSE transport straightforward.
+
+4. **`sys.stdout.flush()` and stderr logging are not optional** — the stdio protocol breaks silently if responses buffer or if log output lands on stdout. These two constraints are easy to miss when building the server and painful to debug when they're wrong.
+
+5. **`isError: true` is not the same as a JSON-RPC error** — tool execution failures should be returned as successful RPC responses with `isError: true` in the result content, not as RPC-level errors. This distinction is part of the MCP spec and matters for how the host passes information back to Claude.
+
+6. **For anything beyond a demo, use the official MCP SDK** — the handcrafted JSON-RPC implementation in `mcp_server.py` is intentionally minimal to make the protocol visible. In production, the SDK handles protocol compliance, newer spec features, error codes, and transport options, and it's maintained by Anthropic. The demo value of hand-rolling it is understanding what the SDK does for you.
+
+## Try It Yourself
+
+The full project is on GitHub: [github.com/pyardley/DemoMCPforAPI](https://github.com/pyardley/DemoMCPforAPI)
+
+```powershell
+git clone https://github.com/pyardley/DemoMCPforAPI.git
+cd DemoMCPforAPI
+
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+Copy-Item .env.example .env
+# Edit .env: set DATABASE_URL and ANTHROPIC_API_KEY
+
+# Start the FastAPI server
+.venv\Scripts\uvicorn.exe main:app --host 127.0.0.1 --port 8000
+
+# Test the API directly
+Invoke-RestMethod http://localhost:8000/customer/2
+
+# Run the Claude demo loop (requires ANTHROPIC_API_KEY)
+.venv\Scripts\python.exe mcp_tool.py "Show me details for customer 3"
+```
+
+For Claude Code: open the project folder, reload the VSCode window, and the `get_customer_details` tool will appear automatically once the FastAPI server is running. The `.mcp.json` in the project root handles the registration.
+
+The minimum viable setup requires a SQL Server instance (the `setup_database.sql` script creates the schema and sample data), an Anthropic API key, and Python 3.11–3.13. The MCP integration with Claude Code requires no additional keys — Claude Code reads `.mcp.json` and launches the server subprocess itself.
