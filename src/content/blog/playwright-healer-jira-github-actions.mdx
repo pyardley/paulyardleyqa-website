@@ -58,6 +58,14 @@ function buildDescription(failures, runUrl) {
 
 The script reads `test-results/results.json` (written by Playwright's JSON reporter), extracts the failed test titles and error messages, creates a Bug issue via the REST API, and then attaches the raw screenshots, traces, and results JSON as file attachments. The issue key gets written to `$GITHUB_OUTPUT` so downstream steps can reference it.
 
+The result is a structured Bug ticket with a clickable Actions run link and one bullet per failed test, each showing the title and a truncated error message:
+
+![Auto-created Jira ticket showing the three TC-04 failures with error messages and a link to the GitHub Actions run](/blog/CI_Generated_Jira_1.png)
+
+Screenshots, traces, and the raw `results.json` are attached automatically so anyone triaging the ticket has everything they need without opening the Actions log:
+
+![Jira ticket attachments panel showing five attached files — three screenshots, results.json, and last-run.json](/blog/CI_Generated_Jira_2.png)
+
 The workflow step is straightforward:
 
 ```yaml
@@ -132,6 +140,10 @@ function buildCommentBody(text) {
   };
 }
 ```
+
+When the healer completes, the comment appears on the ticket as a code block containing the full diff and a status summary:
+
+![Jira comment posted by the healer agent showing the diff applied to fix the TC-04 locator failures](/blog/CI_Generated_Jira_3.png)
 
 This part of the system produced five consecutive CI failures before it worked reliably. Each failure was a different bug.
 
