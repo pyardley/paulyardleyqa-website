@@ -1,0 +1,275 @@
+---
+title: "Selenium vs Playwright: What Seven Real Tests on an Oracle APEX App Actually Show"
+description: "I ran the same seven end-to-end tests against a live Oracle APEX e-commerce application in both Selenium Ruby and Playwright TypeScript, with Playwright at 1, 2, 3, and 4 workers. The results confirm some well-known theories, contradict others, and reveal exactly when parallelism stops helping and starts hurting."
+pubDate: 2026-05-24
+author: "Paul Yardley"
+tags:
+  [
+    "Playwright",
+    "Selenium",
+    "Performance",
+    "Test Automation",
+    "Oracle APEX",
+    "Benchmarks",
+    "TypeScript",
+    "Ruby",
+  ]
+readingTime: "13 min read"
+draft: false
+---
+
+Most Playwright-versus-Selenium comparisons are synthetic. They benchmark a button click, a form fill, or a navigation on a purpose-built demo app where everything is clean HTML and no server-side rendering surprises are waiting for you. That tells you something about framework overhead in ideal conditions. It doesn't tell you much about what happens on a real application.
+
+The Sanzu Oracle APEX e-commerce portal — the same application I used as the test target in my [Playwright PCOM and AI agents](/blog/playwright-pcom-apex-sanzu) post — is about as far from ideal conditions as you can get. APEX generates dynamic IDs at runtime, fires AJAX region refreshes after nearly every interaction, uses session-based authentication that throttles repeated login attempts, and renders some UI elements entirely through CSS pseudo-elements that don't exist in the DOM at all. It's a genuine test of how each framework handles a modern, server-driven web application under real-world conditions.
+
+I ran the same seven tests in Selenium WebDriver (Ruby/RSpec) and in Playwright (TypeScript), with Playwright running at 1, 2, 3, and 4 workers. This post covers what I was measuring, what each test actually exercises, the setups for both frameworks, and what the numbers revealed — including the anomalies that don't fit the standard narrative.
+
+## The Seven Tests and What They Each Measure
+
+Choosing which tests to include in a performance comparison is a design decision. Include only fast tests and you're benchmarking test setup overhead. Include only slow tests and you're benchmarking the application, not the framework. The goal was to cover a representative spread of the performance dimensions that matter for an APEX e-commerce application.
+
+### HP-01 — Product Grid Renders All Catalogue Items
+
+**Performance dimension: heavy page render with bulk element validation.**
+
+The Sanzu home page loads eleven product cards, each with a name, prices (original and sale), star rating, countdown timer on discounted items, and an "Add to Cart" button. HP-01 verifies that all eleven are present and correctly structured.
+
+This test is dominated by how efficiently each framework can locate and validate a large number of elements after a full page load. Selenium's WebDriver HTTP round-trips per element query compound at scale; Playwright's persistent WebSocket connection and CDP integration handle bulk element work more efficiently. This was expected to be one of the biggest differentiators.
+
+### AUTH-01 — Successful Login Redirects to Home
+
+**Performance dimension: form fill, submit, and redirect chain.**
+
+Navigate to the login page, fill username and password, submit, and assert that the browser lands on `/home`. APEX processes the login server-side and issues a redirect with a new session ID embedded in the URL — so the test has to wait for both the POST and the subsequent GET.
+
+This test is representative of any authentication flow: form interaction followed by a navigation wait. The APEX throttling behaviour adds a real-world constraint — if credentials are wrong, the next login attempt is blocked for a cooldown period, which is why the seed spec uses `Promise.race()` across success, throttle, and bad-credentials URL patterns.
+
+### AUTH-02 — Invalid Password Shows Error Message
+
+**Performance dimension: form fill and DOM assertion on error state.**
+
+Same form, wrong password. The test asserts that an error message appears on the page without navigation occurring. APEX renders the error inline — no redirect, no page reload — via a partial page refresh.
+
+The interesting thing here is what each framework does between "submit" and "assert". Selenium typically requires an explicit wait for the error element to be visible. Playwright's auto-waiting means the assertion itself acts as the wait — it retries until the condition is met or the timeout expires. This architectural difference was expected to show a meaningful speedup.
+
+### CART-01 — Adding a Product Updates Cart Sidebar (Authenticated)
+
+**Performance dimension: AJAX interaction and dynamic DOM update.**
+
+This test requires an authenticated session. It clicks "Add to Cart" on the first product, then waits for the cart sidebar widget to reflect the updated total. The cart update is a classic APEX AJAX region refresh: clicking the button fires `apex.server.process()`, which posts to the server and triggers a selective re-render of the cart widget without a full page reload.
+
+The test exercises the part of the APEX interaction model that causes the most problems for automation: an action that produces a visible change without a navigation event. Frameworks that rely on URL changes or page loads to know "something happened" struggle here. Playwright's `waitForResponse` or element-state waiting handles it cleanly.
+
+### CHK-01 — Proceed to Checkout (Authenticated)
+
+**Performance dimension: authenticated multi-step navigation.**
+
+Starting from the home page with an authenticated session and an item in the cart, this test navigates to the cart page and clicks "Proceed to Checkout", asserting that the checkout page loads. It chains two navigations through APEX pages that both require a valid session.
+
+The test isn't particularly heavy in terms of DOM interaction — it's mostly navigation and redirect handling. The expectation was that both frameworks would handle this at roughly similar speed, since application response time dominates over framework overhead when there's little element interaction.
+
+### PD-01 — Product Detail Page Displays Full Information
+
+**Performance dimension: simple content page verification.**
+
+Navigate to a product detail page and verify that the product name, description, price, and Add to Cart button are all present and visible. This is the lightest test in the suite — a straightforward navigation followed by a handful of element assertions on a single-purpose APEX page.
+
+Including a simple test matters for a fair comparison. A framework that's faster on complex interactions but comparable on simple ones tells a different story from one that's consistently faster across all test types.
+
+### SF-04 — Smart Filter Expands and Collapses on Toggle
+
+**Performance dimension: JavaScript widget interaction with state verification.**
+
+The Smart Filter is a collapsible sidebar panel on the Sanzu home page — a CSS-animated widget that expands and collapses when its header is clicked, revealing or hiding category and price filter controls. The test clicks to expand, asserts the filter is visible, clicks to collapse, and asserts it's hidden again.
+
+This test exercises framework speed on JavaScript-driven UI state changes. It's also the test that revealed the most interesting anomaly when worker count increased — more on that shortly.
+
+## The Two Setups
+
+### Selenium WebDriver (Ruby/RSpec)
+
+The Selenium suite runs under RSpec with the `selenium-webdriver` gem, driven by ChromeDriver against a headful Chrome instance. Tests run sequentially in a single process — RSpec doesn't parallelize test execution by default, and no Selenium Grid or parallel runner was configured. Each test gets its own browser session, opened and closed within the example. A custom `ResultsLogger` writes individual test durations and timestamps to a CSV at the end of each example.
+
+```ruby
+# spec/support/results_logger.rb (simplified)
+config.after(:each) do |example|
+  elapsed = Time.now - @test_start_time
+  CSV.open(csv_path, 'a') do |csv|
+    csv << [example.full_description, elapsed.round(2), 'selenium-ruby', Time.now.iso8601]
+  end
+end
+```
+
+The suite runs with `bundle exec rspec spec/tests/ --format documentation`. Total elapsed time is reported by RSpec at the end of the run.
+
+### Playwright (TypeScript)
+
+The Playwright suite uses a dedicated comparison config (`playwright.comparison.config.ts`) with two projects:
+
+- **`comparison-setup`**: Runs `seed.spec.ts`, which verifies the app is reachable and saves an authenticated `storageState` to `.auth/`. This runs before the comparison tests and is the overhead that doesn't exist in the Selenium setup.
+- **`comparison`**: Runs the seven test specs, all using Playwright's `fullyParallel: true` mode. At 1 worker this means sequential execution; at 2+ workers tests run concurrently.
+
+Individual test durations come from the JSON reporter's `duration` field (in milliseconds), which measures only the test body execution — not inter-test overhead. Total wall-clock time comes from `stats.duration` in the same report.
+
+```typescript
+// playwright.comparison.config.ts (excerpt)
+export default defineConfig({
+  fullyParallel: true,
+  reporter: [['list'], ['json', { outputFile: 'playwright-report/comparison-results.json' }]],
+  projects: [
+    { name: 'comparison-setup', testMatch: ['/seed\\.spec\\.ts/'] },
+    { name: 'comparison', testMatch: ['**/hp-01*.ts', '**/auth-0*.ts', /* ... */] },
+  ],
+});
+```
+
+The Playwright tests use the PCOM architecture described in the [previous post](/blog/playwright-pcom-apex-sanzu), which means all element interaction goes through typed page object methods rather than raw `page.locator()` calls. The Selenium tests use a similar page object pattern.
+
+## Selenium vs Playwright: One Worker
+
+The fairest head-to-head comparison is Selenium (sequential) against Playwright at one worker (also sequential, same test order). This isolates framework overhead from parallelism effects.
+
+| Test | Selenium Ruby (s) | Playwright 1w (s) | Speedup |
+| ---- | :---: | :---: | :---: |
+| AUTH-01 — Successful login | 7.32 | 6.45 | 1.13× |
+| AUTH-02 — Invalid password error | 9.76 | 3.63 | **2.69×** |
+| CART-01 — Add to cart (auth) | 6.61 | 6.16 | 1.07× |
+| CHK-01 — Proceed to checkout (auth) | 7.78 | 7.93 | **0.98×** |
+| HP-01 — Product grid (11 items) | 16.69 | 3.84 | **4.35×** |
+| PD-01 — Product detail page | 4.44 | 2.82 | 1.57× |
+| SF-04 — Smart Filter toggle | 5.22 | 4.19 | 1.25× |
+| **Suite wall clock** | **57.83** | **49.84** | **1.16×** |
+
+The overall 1.16× suite speedup is real but modest — closer to the "minimal gains" end of the expected 1.5–2× range for sequential Playwright versus Selenium. Two things explain this: the test suite includes navigations and server-side operations where application response time dominates over framework overhead, and Playwright carries setup overhead that Selenium doesn't (the seed project runs before the comparison tests).
+
+Looking at the individual tests tells a more interesting story.
+
+### What Theory Predicted and What Happened
+
+For the straightforward cases, the results align with expectations. **AUTH-02** (2.69×) shows exactly the kind of gain you'd expect from Playwright's auto-waiting architecture: Selenium required an explicit `wait.until(element_to_be_visible)` call for the error message, adding overhead that Playwright's assertion-level retry eliminates. **PD-01** (1.57×) and **SF-04** (1.25×) show steady gains from Playwright's lower per-command latency via the persistent WebSocket connection rather than Selenium's HTTP-per-command WebDriver protocol. **AUTH-01** (1.13×) and **CART-01** (1.07×) show modest improvements — both tests are dominated by server round-trips rather than framework operations, which compresses the headroom for framework-level gains.
+
+### The Two Anomalies
+
+**HP-01 at 4.35× is much faster than expected.** The product grid test took 16.69 seconds in Selenium and 3.84 seconds in Playwright — a gap that's hard to explain entirely through framework protocol differences. Three factors compound here. First, HP-01 validates eleven product cards, each requiring multiple element lookups; at Selenium's HTTP-per-command overhead, eleven cards multiplied by several assertions each accumulates significant latency that Playwright's WebSocket and CDP integration eliminates almost entirely. Second, Playwright's smart waiting on element visibility means it can proceed as soon as each element is actionable, without the conservative fixed sleeps or retry loops that the Selenium implementation required to handle APEX's variable render timing. Third, this is where the Ruby-versus-TypeScript language difference has the most visible effect: TypeScript's async/await model and Node.js's non-blocking I/O handle the burst of element queries more efficiently than Ruby's synchronous model.
+
+The combination produces a result that looks disproportionate, but each factor is real. It's a useful reminder that "framework overhead" isn't a single number — it's a multiplier that compounds with the number of element interactions in a test.
+
+**CHK-01 at 0.98× is slower in Playwright.** The checkout navigation test is the one case where Playwright was marginally slower than Selenium (7.93s vs 7.78s — a 150ms difference). This is within measurement noise for a single run, but it's still notable. CHK-01 chains two authenticated APEX navigations: home → cart → checkout. Each navigation requires APEX to validate the session, generate a page, and fire the JavaScript page-load lifecycle before the test can proceed. When the test is almost entirely server response time, the framework overhead advantage Playwright holds shrinks to nothing — and the specific wait strategy Playwright uses (waiting for the checkout page to be in a fully interactive state) can introduce slightly more wait time than Selenium's URL-based assertion in cases where the server is fast and the element interaction is minimal.
+
+This is the scenario described in the benchmark literature as "minimal gains" — the test is dominated by application response time rather than automation overhead, and there's simply less room for the framework to help.
+
+## The Parallelism Experiments
+
+The more interesting question for teams considering migration is what happens when you turn parallelism on. Playwright's native parallel execution is often cited as its biggest practical advantage over Selenium, which requires a Grid or external parallel runner. Here's what the worker-count sweep produced:
+
+| Configuration | Wall clock (s) | Speedup vs Selenium |
+| --- | :---: | :---: |
+| Selenium Ruby (sequential) | 57.83 | — |
+| Playwright 1 worker | 49.84 | 1.16× |
+| Playwright 2 workers | **25.29** | **2.29×** |
+| Playwright 3 workers | 32.84 | 1.76× |
+| Playwright 4 workers | 55.78 | 1.04× |
+
+Two workers cuts the suite time nearly in half. Three workers is slower than two. Four workers is barely faster than Selenium.
+
+This is not the result you'd expect from a textbook parallelism explanation, and it deserves examination.
+
+### Why 2 Workers Won
+
+With seven tests and two workers, the suite runs in roughly two batches of three and four tests respectively. Neither worker is idle for long, and both are running tests that spend most of their time waiting for server responses — which is inherently async and doesn't saturate the CPU or network. The two concurrent browser instances fit comfortably within the machine's resource envelope.
+
+Looking at individual test durations at 2 workers, they're almost identical to 1 worker:
+
+| Test | 1w (s) | 2w (s) | Change |
+| ---- | :---: | :---: | :---: |
+| AUTH-01 | 6.45 | 6.27 | −0.18 |
+| AUTH-02 | 3.63 | 3.85 | +0.22 |
+| CART-01 | 6.16 | 5.81 | −0.35 |
+| CHK-01 | 7.93 | 6.80 | −1.13 |
+| HP-01 | 3.84 | 3.97 | +0.13 |
+| PD-01 | 2.82 | 2.76 | −0.06 |
+| SF-04 | 4.19 | 3.83 | −0.36 |
+
+Individual test performance is essentially unchanged between 1 and 2 workers. The wall-clock improvement comes entirely from running tests in parallel, not from any per-test speedup. This is exactly the behaviour you want: parallelism without contention.
+
+### The Resource Contention Problem at 3 and 4 Workers
+
+Three and four workers tell a different story. Individual test durations balloon in specific tests:
+
+| Test | 1w (s) | 2w (s) | 3w (s) | 4w (s) |
+| ---- | :---: | :---: | :---: | :---: |
+| HP-01 | 3.84 | 3.97 | **12.26** | **11.87** |
+| SF-04 | 4.19 | 3.83 | **13.25** | **12.98** |
+| AUTH-01 | 6.45 | 6.27 | 6.30 | **19.17** |
+| CART-01 | 6.16 | 5.81 | 6.74 | **20.06** |
+| CHK-01 | 7.93 | 6.80 | 7.95 | **19.75** |
+
+HP-01 triples in duration going from 2 to 3 workers. SF-04 more than triples. At 4 workers, AUTH-01, CART-01, and CHK-01 all jump from the 6–8 second range to the 19–20 second range. These aren't noise — they're a consistent signal that something is saturating at higher concurrency.
+
+The most likely culprit is a combination of local machine resource saturation and the APEX application itself. Each Playwright worker runs a full Chromium browser instance with its own renderer process. Three concurrent Chromium instances on a laptop compete for CPU, memory, and GPU resources — especially on tests like HP-01 that involve rendering eleven product cards with images, prices, countdown timers, and JavaScript widgets simultaneously across three browser instances. When the CPU is under pressure, render time slows down, and tests that depend on element visibility (which HP-01 does for all eleven cards) see their wait times expand accordingly.
+
+SF-04's similar blowup at 3+ workers points to the same root cause. The Smart Filter toggle is a CSS-animated widget — the animation frame rate drops under CPU contention, and Playwright's visibility assertion has to wait longer for the panel to reach its final state before the assertion passes.
+
+The APEX server itself may also be a factor. If all workers are hitting the same APEX instance simultaneously, session management and page generation compete for the same server resources. Each authenticated test (CART-01, CHK-01, AUTH-01) requires APEX to validate a session and generate page content — three or four of those happening at once on a cloud-hosted demo instance is a meaningful load increase.
+
+The practical lesson: **parallelism has a saturation point that depends on the machine running the tests and the application being tested.** Adding workers past that point doesn't add concurrency — it adds contention, and contention makes every test slower. Optimal worker count for this suite on this machine was 2. For a CI runner with more resources (more cores, more RAM, a beefier remote application server), the sweet spot might be 4 or 6. Finding it requires measuring, not guessing.
+
+### The Curious Case of 3 Workers Being Faster Than 4
+
+Three workers (32.84s) beats four workers (55.78s) by a significant margin. This seems counterintuitive — more parallelism should be at least as fast, if not faster. The explanation is that the 4-worker configuration pushed the machine into a regime where contention was severe enough that tests that had been running in 6–8 seconds now took 19–20 seconds. The longer individual test durations overwhelmed the benefit of having one more concurrent worker.
+
+This is a good example of why benchmarking parallelism configurations matter. A team that jumps straight to "use as many workers as possible" and measures the result might conclude that Playwright parallelism is slow, when the real conclusion is that their specific machine saturates at 2 or 3 workers.
+
+## Comparing Against the Expected Range
+
+The research literature and community migration reports suggest Playwright delivers:
+
+- **Individual tests**: 1.5–2× faster than Selenium for typical E2E flows
+- **Full suites**: 2–5× faster when parallelism is properly configured
+- **Largest gains**: Tests with heavy explicit waits, many element interactions, or large parallel footprints
+
+Against those benchmarks, here's how the Sanzu results compare:
+
+**Individual test speedups (Playwright 1w vs Selenium)** ranged from 0.98× (CHK-01, essentially no gain) to 4.35× (HP-01). The median was around 1.25×. That's at the lower end of the typical range — consistent with a test suite where server response time and APEX session overhead are significant, compressing the available headroom for framework improvements.
+
+**Suite speedup with optimal parallelism (2 workers)** was 2.29×. That sits squarely in the expected range and confirms that the biggest practical win from Playwright migration on this kind of suite isn't individual test speed — it's the ease of adding parallelism. The 2-worker configuration required zero additional infrastructure. No Selenium Grid, no TestNG parallel runner configuration, no Docker Compose setup — just `--workers=2` in the Playwright config.
+
+The notable outlier is HP-01 at 4.35×. That's beyond the typical individual-test range and reflects the compound effect of bulk element validation across eleven cards, Playwright's CDP-based element handling, and the elimination of the conservative explicit waits the Selenium implementation needed to handle APEX's variable rendering time. Tests with similar characteristics — lots of elements, variable render timing, no explicit sleeps replaced — are where Playwright's architectural advantages are most visible.
+
+## What These Results Suggest for Reducing Execution Time
+
+The data from this experiment map directly onto the general advice for faster regression suites, but the prioritisation depends heavily on where your tests spend their time.
+
+**Parallelism is the highest-leverage lever, but only to a point.** Going from 1 to 2 workers cut 24 seconds off a 50-second suite. Going from 2 to 4 workers added 30 seconds back. The right worker count is a measurement exercise, not a "more is better" assumption. For most teams starting out, 2–4 workers is the range worth benchmarking, with the expectation that the optimal value depends on the CI runner spec and the application being tested.
+
+**Auto-waiting eliminates the hidden cost of explicit waits.** AUTH-02's 2.69× speedup is almost entirely attributable to removing a `wait.until(visibility_of_element_located(...))` call that Playwright's assertion retry renders unnecessary. Every explicit `sleep` or `wait.until` in a Selenium suite is a potential speedup if the team migrates to Playwright's auto-waiting model. The HP-01 result suggests the gains compound across tests with many such waits.
+
+**Protocol overhead matters most at scale.** HP-01's 4.35× speedup illustrates that Playwright's WebSocket/CDP protocol advantage is most visible when a single test makes many element queries in sequence. PD-01's more modest 1.57× and CART-01's 1.07× show that for tests dominated by a few element interactions and server response time, the protocol difference is less visible. Profiling your slowest tests to understand whether they're dominated by framework overhead or application response time tells you how much you can expect to gain from migration alone.
+
+**Test scope and ordering matter.** The Playwright suite has setup overhead that Selenium doesn't — the seed project runs before the comparison tests, adding ~14 seconds of fixed cost to the 1-worker run. This overhead is amortised across the parallel workers and doesn't scale with test count, but for a small suite it's visible. Smoke/sanity suites should be lean and independent; setup costs should be shared efficiently through fixtures and `storageState` rather than repeated per-test.
+
+**Infrastructure ceiling.** The 3 and 4 worker contention results make the case for investing in CI runner specs before adding more worker slots. A 4-core CI runner hitting 4-worker contention would benefit more from upgrading to an 8-core runner than from tuning the test code. On cloud CI (GitHub Actions, GitLab CI), runner selection is often cheaper than you'd expect for the benefit it delivers.
+
+## Key Takeaways
+
+**Playwright is faster than Selenium on these tests, but not uniformly.** The suite-level improvement at 1 worker is a modest 1.16×. Individual tests range from 0.98× (no improvement) to 4.35× (dramatic improvement). Tests dominated by server response time and APEX session overhead show the smallest gains; tests with bulk element validation or heavy explicit waits show the largest.
+
+**The biggest practical win from Playwright migration is frictionless parallelism.** The 2-worker configuration required one config change and delivered a 2.29× speedup. Achieving equivalent parallelism in Selenium requires a Grid, a parallel runner configuration, and test isolation discipline that the Playwright setup handles automatically through browser contexts and `storageState`.
+
+**Parallelism has a saturation point.** At 3 workers, HP-01 went from 3.97s to 12.26s. At 4 workers, CART-01 went from 5.81s to 20.06s. Adding workers past the machine's resource ceiling doesn't add concurrency — it adds contention that makes every test slower. Find the sweet spot empirically rather than assuming "more workers = faster suite".
+
+**CHK-01 not being faster is the honest result.** A test that chains two APEX page navigations with server-side session validation is dominated by application response time, not framework overhead. Playwright won't speed up your tests if the bottleneck is the server. That doesn't mean migration isn't worth it — it means it's worth profiling your suite before migrating to understand where the actual time goes.
+
+**HP-01's 4.35× speedup is real, but understand what drove it.** Bulk element validation, eliminated explicit waits, and compound protocol efficiency — these three factors together produced a result that looks extraordinary but has a coherent explanation. Tests with similar characteristics in your own suite are your best candidates for early migration.
+
+**The language shift from Ruby to TypeScript adds a small additional boost.** Node.js's async I/O model handles concurrent element queries and promise chains more efficiently than Ruby's synchronous model, especially for tests like HP-01 that make many sequential element assertions. The framework architecture is the dominant factor in the comparison, but the language isn't entirely neutral.
+
+## The Code
+
+The Playwright test suite is on GitHub: [github.com/pyardley/playwright_PCOM_Apex](https://github.com/pyardley/playwright_PCOM_Apex)
+
+The comparison configuration that drove these results is `playwright.comparison.config.ts` in the project root. The Selenium Ruby suite lives in `selenium-comparison/spec/` in the same repository, with the timing CSV written to `selenium-comparison/results/timing_comparison.csv`.
+
+The raw performance data — per-test durations across all five configurations — is in `performance_summary.csv` in the results folder. If you're running a similar comparison on your own app, the structure of that CSV is a reasonable template for capturing the data you need to find your own parallelism sweet spot.
+
+The Sanzu application is available to explore at [builtwithapex.com](https://www.builtwithapex.com) — search for the Sanzu e-commerce portal. It's a useful benchmark target for anyone working with APEX: real authentication, real AJAX, real server-side rendering variability, and enough UI complexity to make the framework differences visible.
