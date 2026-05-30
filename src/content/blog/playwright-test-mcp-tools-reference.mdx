@@ -1,0 +1,315 @@
+---
+title: "The mcp__playwright-test__ Reference: What Every Tool Does and Where You'd Use It"
+description: "A complete guide to all 82 tools exposed by the Playwright MCP server — grouped by function, with descriptions and concrete use cases. The planner, generator, and healer agents use fewer than 30 of them."
+pubDate: 2026-05-30
+author: "Paul Yardley"
+tags:
+  [
+    "Playwright",
+    "MCP",
+    "Claude Code",
+    "AI Agents",
+    "Test Automation",
+    "Reference",
+    "Browser Automation",
+  ]
+readingTime: "20 min read"
+draft: false
+---
+
+Whilst using the planner, generator, and healer agents for both Playwright and Selenium pipelines, I noticed tool names in the MCP server's capabilities that none of the agents ever called. `browser_start_video`. `browser_route`. `browser_cookie_set`. `browser_localstorage_set`. `browser_network_state_set`. The agents collectively use fewer than 30 of the server's 82 tools. The other 55 are simply there, available to any agent whose system prompt lists them and largely unexplored.
+
+This is the reference I wanted when building those agents: every tool, what it actually does (based on its schema, not guesswork) and what you'd use it for.
+
+## How the Tools Are Grouped
+
+The 82 tools divide into three broad layers:
+
+**browser control layer**: navigation, interaction, inspection, state manipulation (what the existing agents draw from most heavily).
+
+**observation and capture layer**: console monitoring, network inspection, recording, tracing, annotation (partially used at best).
+
+**framework integration layer**: planner, generator, and test tools which ties the browser to Playwright's own infrastructure and has no equivalent outside the Playwright ecosystem.
+
+Within those layers I've grouped related tools into sections. Tools marked with ★ are currently unused by any of the six Playwright or Selenium agents.
+
+---
+
+## Navigation and Page Control
+
+| Tool                         | What it does                                       | Where you'd use it                                                                               |
+| ---------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `browser_navigate`           | Navigates to a URL                                 | The starting point of every agent session                                                        |
+| `browser_navigate_back`      | Presses the browser's back button                  | Testing that back-navigation preserves scroll position or unsaved form state                     |
+| `browser_navigate_forward` ★ | Presses the browser's forward button               | Verifying forward-navigation after a back event, or testing browser history flows                |
+| `browser_reload` ★           | Reloads the current page                           | Testing that state (shopping cart, form data) survives a reload; verifying cache behaviour       |
+| `browser_close` ★            | Closes the current page                            | Clean teardown after a recording or documentation session                                        |
+| `browser_resize` ★           | Resizes the viewport to specified pixel dimensions | Responsive layout testing — compare the same page at 375 × 812 (mobile) and 1440 × 900 (desktop) |
+
+---
+
+## User Interaction
+
+The thirteen interaction tools simulate keyboard and standard pointer input. `browser_keydown`, `browser_keyup`, `browser_press_sequentially`, `browser_check`, `browser_uncheck`, and `browser_fill_form` are unused by all current agents.
+
+| Tool                           | What it does                                                                                                                                                   | Where you'd use it                                                                                                                                           |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `browser_click`                | Clicks an element by selector or snapshot reference                                                                                                            | Form buttons, links, toggles — the most-called tool across all agents                                                                                        |
+| `browser_type`                 | Types text into a focused element                                                                                                                              | Filling text inputs; used by every generator and healer                                                                                                      |
+| `browser_hover`                | Hovers over an element without clicking                                                                                                                        | Revealing hover-only tooltips, dropdown menus, or CSS `:hover` state changes                                                                                 |
+| `browser_press_key`            | Presses a single named key (`Escape`, `Enter`, `Tab`, `ArrowDown`…)                                                                                            | Dismissing modals, submitting forms by keyboard, navigating with arrow keys                                                                                  |
+| `browser_keydown` ★            | Holds a key down without releasing                                                                                                                             | Initiating modifier key combinations — `Shift`, `Control`, `Alt`, `Meta` — held while another tool clicks or types                                           |
+| `browser_keyup` ★              | Releases a held key                                                                                                                                            | Completing a `browser_keydown` modifier key sequence                                                                                                         |
+| `browser_press_sequentially` ★ | Types text into the currently focused element one key at a time, firing real `keydown`/`keypress`/`keyup` events per character; optionally presses Enter after | Applications with debounced autocomplete or per-keystroke JS handlers that don't fire on programmatic paste or `browser_type`                                |
+| `browser_select_option`        | Selects an option from a `<select>` dropdown by value or label                                                                                                 | Region selection, filter dropdowns, any form with a `<select>`                                                                                               |
+| `browser_check` ★              | Checks a checkbox or selects a radio button                                                                                                                    | Accepting terms of service, toggling boolean form options, selecting from a radio group                                                                      |
+| `browser_uncheck` ★            | Unchecks a checkbox                                                                                                                                            | Resetting a preference, testing the deselected state of a toggle                                                                                             |
+| `browser_fill_form` ★          | Fills multiple form fields — textbox, checkbox, radio, combobox, slider — in a single call                                                                     | Bulk form population without a per-field `browser_type` loop; the primary tool for a test state seeder agent that needs to establish UI-driven state quickly |
+| `browser_file_upload`          | Uploads a file through an `<input type="file">`                                                                                                                | File upload flows, document submission, avatar image upload                                                                                                  |
+| `browser_handle_dialog`        | Accepts or dismisses a browser dialog (`alert`, `confirm`, `prompt`) with optional input text                                                                  | Responding to `window.confirm()` delete prompts, `window.prompt()` inputs, or any JS dialog that would otherwise block execution                             |
+
+---
+
+## Precise Mouse Control
+
+These eight tools operate at pixel coordinates rather than element selectors. They're the right choice when the application responds to mouse position rather than element identity — canvas UIs, drawing tools, custom sliders, map interfaces. None are used by any current agent.
+
+| Tool                       | What it does                                                                                          | Where you'd use it                                                                                |
+| -------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `browser_drag`             | Drags an element onto a target element (semantic drag-and-drop)                                       | Kanban boards, sortable lists, file manager drag-and-drop                                         |
+| `browser_drop` ★           | Drops the currently dragged item onto a target                                                        | Counterpart to `browser_drag` when the drag and drop need to be composed separately               |
+| `browser_mouse_click_xy` ★ | Clicks at pixel coordinates with configurable button (left/right/middle), click count, and hold delay | Canvas apps where elements have no DOM selector — game UIs, drawing tools, SVG map regions        |
+| `browser_mouse_down` ★     | Presses the mouse button at coordinates without releasing                                             | Beginning a click-and-hold gesture, starting a canvas draw                                        |
+| `browser_mouse_up` ★       | Releases the mouse button at coordinates                                                              | Completing a `browser_mouse_down` interaction                                                     |
+| `browser_mouse_move_xy` ★  | Moves the mouse to coordinates without clicking                                                       | Triggering `mousemove` events on a canvas, testing cursor-responsive drawing UI                   |
+| `browser_mouse_drag_xy` ★  | Drags from one coordinate pair to another by holding the left button                                  | Custom range sliders, canvas selection rectangles, pixel-positioned resizable split panes         |
+| `browser_mouse_wheel` ★    | Scrolls by horizontal and vertical pixel deltas at the current mouse position                         | Infinite scroll, lazy-loading triggers, sticky header behaviour, horizontally scrolling carousels |
+
+---
+
+## Inspection and Locators
+
+The inspection tools let an agent understand the current page without prior knowledge of its structure. `browser_snapshot` and `browser_generate_locator` are the workhorses of every agent workflow; `browser_run_code_unsafe` and `browser_get_config` are untouched.
+
+| Tool                        | What it does                                                                                                                                               | Where you'd use it                                                                                                                                                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_snapshot`          | Returns the accessibility tree of the page or a scoped element; supports depth limits, bounding-box coordinates per element, and saving to a markdown file | Understanding page structure before writing tests; diagnosing unexpected UI state during healing; scoping a snapshot to a single component for clarity                                   |
+| `browser_take_screenshot`   | Captures a PNG screenshot                                                                                                                                  | Visual documentation, annotated user guides, failure capture, visual regression baselines                                                                                                |
+| `browser_evaluate`          | Executes a `() => { }` or `(element) => { }` JavaScript function on the page or a specific element and returns the result; can save to file                | Reading computed state not visible in the accessibility tree — `localStorage` values, CSS computed styles, internal framework state, DOM metrics                                         |
+| `browser_run_code_unsafe` ★ | Executes an `async (page) => { }` Playwright function directly in the MCP server process — the schema notes this is RCE-equivalent                         | Complex multi-step Playwright operations not expressible as individual tool calls; seeding data through the app's own JavaScript APIs; resetting application state between test runs     |
+| `browser_generate_locator`  | Generates a Playwright CSS/role locator from an element reference taken from a snapshot                                                                    | The bridge between accessibility-tree element identification and test code; the Selenium generator's healer uses this and then translates the output to Capybara using the locator table |
+| `browser_get_config` ★      | Returns the current browser configuration including viewport size, user agent, and base URL                                                                | Confirming a test is running at the expected viewport; debugging unexpected responsive behaviour                                                                                         |
+
+---
+
+## Waiting
+
+| Tool               | What it does                                                                                                                                                 | Where you'd use it                                                                                                                         |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `browser_wait_for` | Waits for specified text to **appear** on the page (`text`), for text to **disappear** (`textGone`), or for a fixed number of **seconds** to elapse (`time`) | AJAX-loaded content, post-submit redirects, loading spinners that must clear before the next interaction, animations that need to complete |
+
+Three wait patterns in one tool. The text-based patterns are generally more resilient than `time` because they resolve as soon as the condition is met rather than sleeping a fixed duration.
+
+---
+
+## Console and Network
+
+`browser_console_messages` and `browser_network_requests` are used by the planner and healer; the remaining four tools are untouched.
+
+| Tool                          | What it does                                                                                                                                           | Where you'd use it                                                                                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_console_messages`    | Returns all console messages (log, warn, error, info) since the session started                                                                        | Detecting silent JavaScript errors; verifying that analytics events or debug logs fire at the right moment                                                        |
+| `browser_console_clear` ★     | Clears the accumulated console message log                                                                                                             | Isolating the console output from a specific user action — clear, perform the action, read                                                                        |
+| `browser_network_requests`    | Returns a numbered list of network requests since the session started; filterable by URL regex; can optionally include static assets; can save to file | Verifying the right API calls fire on user action; generating an API dependency map for a service; the starting point for an API contract or mock generator agent |
+| `browser_network_request` ★   | Returns the full details of one numbered request — request headers, request body, response headers, response body — in whole or by part                | Extracting request/response payloads to create mock fixtures; verifying the exact body sent to an API endpoint                                                    |
+| `browser_network_clear` ★     | Clears the accumulated network request list                                                                                                            | Scoping network capture to a single user action — clear, perform the action, read only the relevant requests                                                      |
+| `browser_network_state_set` ★ | Sets the browser's network state to `online` or `offline`                                                                                              | Testing that an application handles loss of connectivity gracefully — offline messages, cached content fallback, data-entry preservation                          |
+
+One important limitation: `browser_network_state_set` supports only `online` and `offline`. There is no built-in bandwidth throttling through this tool. Simulating slow 3G or custom latency requires using Chrome DevTools Protocol directly via `browser_evaluate` or `browser_run_code_unsafe`.
+
+---
+
+## Verification
+
+Four lightweight assertions that confirm element or text presence without pulling a full accessibility snapshot. Used by the Playwright generator; absent from the Selenium pipeline, which uses RSpec's `expect(page).to have_*` matchers instead.
+
+| Tool                             | What it does                                                                            | Where you'd use it                                                                                                     |
+| -------------------------------- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `browser_verify_element_visible` | Asserts that an element with a given ARIA role and accessible name is visible on screen | Quick smoke checks using accessibility attributes rather than CSS selectors — "is a button labelled 'Submit' present?" |
+| `browser_verify_list_visible` ★  | Asserts that a list of named elements are all visible                                   | Verifying a complete navigation menu, a full set of form fields, or a multi-item result set in one call                |
+| `browser_verify_text_visible`    | Asserts that specific text appears anywhere on the page                                 | Checking success messages, error strings, page headings, or any content that doesn't need a selector                   |
+| `browser_verify_value` ★         | Asserts that an input or select element has a specific value                            | Confirming a field was pre-populated correctly, or that a user's selection persisted after navigation                  |
+
+---
+
+## Request Interception
+
+Three tools for replacing real network responses with controlled fixtures. None are used by any current agent.
+
+| Tool                   | What it does                                                                                                                 | Where you'd use it                                                                                                                                                                |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_route` ★      | Intercepts all requests matching a URL pattern and returns a specified HTTP status, response body, content type, and headers | Replacing a live API endpoint with a fixture for CI testing; simulating 500/404/empty error states; removing CORS restrictions; testing how the UI handles specific data payloads |
+| `browser_unroute` ★    | Removes a previously registered route interceptor by pattern                                                                 | Restoring real network behaviour after a mocked section of a test                                                                                                                 |
+| `browser_route_list` ★ | Lists all currently active route interceptors                                                                                | Debugging which mocks are in effect when test behaviour differs unexpectedly from the live app                                                                                    |
+
+The practical combination: use `browser_network_requests` and `browser_network_request` to capture real API responses from a live environment, then use `browser_route` to replay those captured responses in CI without a live backend. This is the core workflow for an API mock generator agent — capture once, replay anywhere.
+
+---
+
+## Annotation and Visual Overlays
+
+| Tool                       | What it does                                                                                                                                                                                                   | Where you'd use it                                                                                                                                                                                            |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_annotate` ★       | Opens the **Playwright Dashboard in annotation mode** and waits for a human to draw annotations on the page; returns the annotated screenshot, an accessibility snapshot, and a structured list of annotations | A human-in-the-loop tool: an agent pauses at a significant page state, a developer draws markup in the Dashboard, and the agent receives structured annotation data to incorporate into a report or test plan |
+| `browser_highlight` ★      | Shows a persistent highlight overlay around an element, styled with optional custom CSS                                                                                                                        | Highlighting the element under discussion before taking a documentation screenshot; visually marking a failure location before capturing a bug report                                                         |
+| `browser_hide_highlight` ★ | Removes any active highlight overlay                                                                                                                                                                           | Capturing a clean screenshot after annotating — highlight the element, screenshot with overlay visible, remove it, screenshot again for the clean version                                                     |
+
+`browser_annotate` is the only interactive tool in the server. It pauses execution and waits for human input in the Playwright Dashboard before returning. Every other tool completes immediately without human intervention. This makes `browser_annotate` most suitable for human–agent collaborative workflows rather than fully unattended automation.
+
+---
+
+## Browser Tabs
+
+| Tool             | What it does                                                                                                                                                           | Where you'd use it                                                                                                                                                         |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_tabs` ★ | Takes one of four actions — `list` (enumerate open tabs), `new` (open a tab, optionally at a URL), `close` (close a tab by index), `select` (switch to a tab by index) | Multi-tab scenarios: OAuth consent popups, links that open in a new tab, admin-panel + end-user-view side-by-side, verifying that `target="_blank"` links behave correctly |
+
+A typical OAuth tab flow: `browser_click` on the sign-in button → `browser_tabs` with `list` to find the newly opened consent popup → `browser_tabs` with `select` to switch to it → interact with the popup → `browser_tabs` with `select` to return to the original tab.
+
+---
+
+## Browser State: Cookies, Storage, and State Snapshots
+
+The storage manipulation tools are entirely absent from all six existing agents. They're the most direct route to fast test precondition establishment — reaching a known state (authenticated, cart populated, preferences set) without navigating the full UI flow on every test run.
+
+### Cookies
+
+| Tool                      | What it does                                                             | Where you'd use it                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `browser_cookie_set` ★    | Sets a cookie with name, value, domain, path, expiry, and security flags | Injecting an authentication session token to bypass the login flow; pre-setting a feature-flag cookie |
+| `browser_cookie_get` ★    | Retrieves the value of a named cookie                                    | Capturing a session token after login for inclusion in a storage state fixture                        |
+| `browser_cookie_delete` ★ | Deletes a named cookie                                                   | Testing logged-out behaviour after session expiry; verifying that logout clears the session cookie    |
+| `browser_cookie_list` ★   | Lists all cookies set for the current origin                             | Auditing what cookies a page sets; verifying the absence of tracking cookies after a user opts out    |
+| `browser_cookie_clear` ★  | Deletes all cookies for the current origin                               | Full clean-state reset between test scenarios                                                         |
+
+### LocalStorage
+
+| Tool                            | What it does                                   | Where you'd use it                                                                                                  |
+| ------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `browser_localstorage_set` ★    | Sets a localStorage key-value pair             | Injecting user preferences, feature flags, or onboarding state that the application reads from localStorage on load |
+| `browser_localstorage_get` ★    | Retrieves a localStorage value by key          | Verifying that the app correctly persisted a setting after an action                                                |
+| `browser_localstorage_delete` ★ | Deletes a localStorage key                     | Testing first-run behaviour by removing a `hasSeenOnboarding` flag                                                  |
+| `browser_localstorage_list` ★   | Lists all localStorage key-value pairs         | Auditing what an app stores; comparing storage state before and after a significant user action                     |
+| `browser_localstorage_clear` ★  | Clears all localStorage for the current origin | Complete client-side state reset                                                                                    |
+
+### SessionStorage
+
+`browser_sessionstorage_set`, `browser_sessionstorage_get`, `browser_sessionstorage_delete`, `browser_sessionstorage_list`, and `browser_sessionstorage_clear` have identical signatures and use cases to their `localstorage` equivalents. The distinction is scope: sessionStorage is cleared when the tab closes and is not shared across tabs. Use these tools when the application stores session-scoped state — wizard progress, multi-step form data — that you need to establish or verify without navigating to it via the UI.
+
+### Storage State Snapshots
+
+| Tool                          | What it does                                                                                                 | Where you'd use it                                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `browser_storage_state` ★     | Saves a JSON snapshot of all current cookies and localStorage to a file (defaults to a timestamped filename) | Capturing the complete browser state after a manual login so it can be replayed in future test sessions           |
+| `browser_set_storage_state` ★ | Restores cookies and localStorage from a previously saved state file, clearing all existing state first      | Instantly re-establishing an authenticated session at the start of a test without navigating through the login UI |
+
+`browser_storage_state` and `browser_set_storage_state` are the building blocks of Playwright's `storageState` pattern. Log in once, save the state, and every subsequent test that needs an authenticated user calls `browser_set_storage_state` instead of replaying the login flow — turning a multi-second UI sequence into a millisecond file restore.
+
+---
+
+## Recording, Tracing, and PDF Export
+
+These six tools produce durable artifacts from a browser session. None are called by any existing agent.
+
+| Tool                      | What it does                                                                                                                                  | Where you'd use it                                                                                                                                  |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_start_video` ★   | Begins recording a video of the browser session; accepts an optional filename and viewport dimensions                                         | Starting a capture before navigating a user workflow — for demo videos, user guides, or recording failures for bug reports                          |
+| `browser_video_chapter` ★ | Inserts a full-screen chapter title card into the current recording, with a title, optional description, and display duration in milliseconds | Producing a chaptered walkthrough video where each workflow gets its own named section — _"1. Product Search"_, _"2. Add to Cart"_, _"3. Checkout"_ |
+| `browser_stop_video` ★    | Ends the video recording and saves the file                                                                                                   | Completing the recording after all workflows have been navigated                                                                                    |
+| `browser_start_tracing` ★ | Begins a Chromium DevTools performance trace — no parameters                                                                                  | Capturing CPU, memory, JavaScript execution, network activity, and rendering timelines for a specific user flow                                     |
+| `browser_stop_tracing` ★  | Ends the performance trace and saves it — no parameters                                                                                       | The saved trace file opens in `chrome://tracing` or Perfetto for detailed analysis of where time was spent                                          |
+| `browser_pdf_save` ★      | Saves the current page as a PDF; defaults to a timestamped filename                                                                           | Generating documentation from a live web page, capturing full-page content that exceeds the viewport, producing printable reports                   |
+
+The `browser_start_tracing` / `browser_stop_tracing` pair produces a Chrome DevTools Protocol trace. Wrap a specific user interaction — say, clicking a filter that triggers a heavy re-render — between start and stop, open the resulting file in `chrome://tracing`, and the timeline shows exactly what the browser spent time on: JavaScript execution, style recalculation, layout, paint, compositor work, network. For a performance profiling agent, the trace is the primary deliverable.
+
+---
+
+## Execution Control
+
+| Tool               | What it does                                                                                                                                                                                       | Where you'd use it                                                                                                                                                                                                          |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_resume` ★ | Resumes execution after a Playwright debug pause; `step: true` causes execution to pause again immediately before the next action; `location` sets a `file:line` breakpoint at which to pause next | Used within the `test_debug` workflow — the healer calls `test_debug` to pause at a failure, then calls `browser_resume` with `step: true` to advance one action at a time while inspecting browser state between each step |
+
+---
+
+## The Framework Layer: Test, Generator, and Planner Tools
+
+The final twelve tools don't control the browser directly. They connect the browser layer to Playwright's test infrastructure — running tests, generating code, and managing planning sessions. They're the layer most tightly coupled to the Playwright ecosystem.
+
+### Test Execution
+
+Used exclusively by the Playwright healer. The Selenium healer replaces all three with `bundle exec cucumber` commands via the Bash tool.
+
+| Tool          | What it does                                                                                                   | Where you'd use it                                                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_run`    | Runs tests at specified file/folder/line locations and optional Playwright projects; returns pass/fail results | Starting a healer session: identify which tests are currently failing before any investigation                                               |
+| `test_debug`  | Runs a single test by ID in debug mode, pausing execution at the point of failure                              | Inspecting the exact browser state at the moment a test fails, without having to manually navigate to that state                             |
+| `test_list` ★ | Lists all available tests with their IDs and file locations                                                    | Discovering what tests exist; building an index before deciding what to run or debug; checking what a generated test suite actually contains |
+
+### Generator Tools
+
+Used exclusively by the Playwright generator. The Selenium generator replaces `generator_read_log` + `generator_write_test` with direct file writes via the generic `Write` tool.
+
+| Tool                   | What it does                                                                                                                              | Where you'd use it                                                                                                                                                        |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generator_setup_page` | Initialises a generator session with a test plan string, opening the browser using an optional seed file and Playwright project           | Must be called first in any generator workflow; the `plan` parameter describes the flow about to be executed                                                              |
+| `generator_read_log`   | Returns a structured log of every browser tool call made during the current generator session                                             | Called after executing all test steps; the log captures tool names, arguments, and return values — the raw material that `generator_write_test` translates into test code |
+| `generator_write_test` | Writes a generated TypeScript `.spec.ts` test file following Playwright's conventions, based on the session log and the agent's reasoning | The final step of every Playwright generator session; understands the Playwright API well enough to translate a sequence of tool calls into idiomatic, runnable test code |
+
+The `generator_read_log` → `generator_write_test` pipeline is what separates the Playwright and Selenium generators architecturally. `generator_write_test` does the framework translation; the Selenium generator has no equivalent hook and must translate Playwright-style locators to Capybara syntax in working memory, which is why the locator translation table in that agent's system prompt is load-bearing rather than decorative.
+
+### Planner Tools
+
+| Tool                    | What it does                                                                                         | Where you'd use it                                                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `planner_setup_page`    | Initialises a planner session, opening the browser with an optional seed file and Playwright project | Must be called before any browser interaction in the planner workflow; the seed file can pre-establish page state before exploration begins |
+| `planner_save_plan`     | Saves the test plan to a markdown file at a specified path                                           | Used by both the Playwright and Selenium planners to persist the plan document for the generator to consume                                 |
+| `planner_submit_plan` ★ | Submits the plan to the Playwright planner framework as an alternative to saving it to disk          | Not used by either current planner agent; may integrate with Playwright's cloud test management tooling                                     |
+
+---
+
+## Which Tools the Existing Agents Use
+
+For completeness — the 27 tools used by at least one agent across both pipelines. Everything not in this table is marked ★ in the sections above.
+
+| Tool                             | SE Planner | SE Generator | SE Healer | PW Planner | PW Generator | PW Healer |
+| -------------------------------- | :--------: | :----------: | :-------: | :--------: | :----------: | :-------: |
+| `browser_navigate`               |     ●      |      ●       |     ●     |     ●      |      ●       |           |
+| `browser_navigate_back`          |     ●      |              |           |     ●      |              |           |
+| `browser_click`                  |     ●      |      ●       |     ●     |     ●      |      ●       |           |
+| `browser_type`                   |     ●      |      ●       |     ●     |     ●      |      ●       |           |
+| `browser_hover`                  |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_drag`                   |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_press_key`              |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_select_option`          |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_file_upload`            |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_handle_dialog`          |     ●      |      ●       |           |     ●      |      ●       |           |
+| `browser_snapshot`               |     ●      |      ●       |     ●     |     ●      |      ●       |     ●     |
+| `browser_take_screenshot`        |     ●      |              |           |     ●      |              |           |
+| `browser_evaluate`               |     ●      |      ●       |     ●     |     ●      |      ●       |     ●     |
+| `browser_generate_locator`       |            |      ●       |     ●     |            |              |     ●     |
+| `browser_wait_for`               |     ●      |      ●       |     ●     |     ●      |      ●       |           |
+| `browser_console_messages`       |     ●      |              |     ●     |     ●      |              |     ●     |
+| `browser_network_requests`       |     ●      |              |     ●     |     ●      |              |     ●     |
+| `browser_verify_element_visible` |            |              |           |            |      ●       |           |
+| `browser_verify_text_visible`    |            |              |           |            |      ●       |           |
+| `browser_verify_list_visible`    |            |              |           |            |      ●       |           |
+| `browser_verify_value`           |            |              |           |            |      ●       |           |
+| `planner_setup_page`             |     ●      |              |           |     ●      |              |           |
+| `planner_save_plan`              |     ●      |              |           |     ●      |              |           |
+| `generator_setup_page`           |            |      ●       |           |            |      ●       |           |
+| `generator_read_log`             |            |              |           |            |      ●       |           |
+| `test_run`                       |            |              |           |            |              |     ●     |
+| `test_debug`                     |            |              |           |            |              |     ●     |
+
+27 tools across 6 agents. The other 55 are documented above and available to any agent whose system prompt includes them.

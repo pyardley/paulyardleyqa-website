@@ -1,0 +1,402 @@
+---
+title: "Porting Playwright's AI Test Agents to Selenium WebDriver: Ruby, Cucumber, and the Locator Translation Problem"
+description: "How I adapted the Playwright planner–generator–healer agent pipeline to produce Ruby + Cucumber + Capybara output instead of TypeScript — what stays the same, what changes, and where the locator translation table becomes critical."
+pubDate: 2026-05-29
+author: "Paul Yardley"
+tags:
+  [
+    "Selenium WebDriver",
+    "Playwright",
+    "Ruby",
+    "Cucumber",
+    "Capybara",
+    "AI Agents",
+    "Test Automation",
+    "Claude Code",
+    "BDD",
+  ]
+readingTime: "15 min read"
+draft: false
+---
+
+The Playwright agent pipeline I described in an [earlier post](/blog/playwright-ai-agents-grok) works well for TypeScript projects. Three agents (planner, generator, healer) share the same MCP browser server. The planner explores the interface and writes a test plan, the generator drives the live app to discover real locators and writes the tests, the healer diagnoses failures and edits the code. Each agent has a defined role and a narrow tool set.
+
+But what if you're using a different stack: Selenium WebDriver with Ruby, Cucumber, and Capybara? Those tests aren't going anywhere, and the teams that maintain them aren't moving to TypeScript. The question was whether the same agent architecture could produce Ruby output without requiring a completely different infrastructure.
+
+The answer is yes, with one key insight and three adaptations that turned out to be more significant than I expected.
+
+## The Key Insight: The Browser Layer Is Framework-Agnostic
+
+Before looking at what changed, it's worth understanding what didn't. Both pipelines share an identical `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "playwright-test": {
+      "command": "cmd",
+      "args": ["/c", "npx", "playwright", "run-test-mcp-server"]
+    }
+  }
+}
+```
+
+The same MCP server that powers the Playwright pipeline also powers the Selenium one. `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_generate_locator` — all of these are browser interactions that have nothing to do with what test framework you're targeting. The server drives a real Chromium instance. What you do with what you learn from that instance is entirely up to the agent.
+
+This is the key insight: the exploration layer and the code generation layer are independent. The planner's job is to learn what the application does. The generator's job is to translate that knowledge into whatever test format the project needs. The MCP tools feed both jobs identically; only the output differs.
+
+The practical implication is that the new project (`SeleniumAgents`) needed nothing in its `.mcp.json` that the Playwright project didn't already have. The infrastructure cost of porting was zero. The work was entirely in the agent prompts.
+
+## Part One: The Planner — Baking Gherkin Into the Plan
+
+The Playwright planner's system prompt is deliberately framework-neutral. It explores the application, maps user flows, identifies edge cases, and saves a structured test plan as a markdown file. The output looks like this:
+
+```markdown
+#### 1.1 Add Valid Todo
+
+**Steps:**
+
+1. Click in the "What needs to be done?" input field
+2. Type "Buy groceries"
+3. Click the "Add todo" button
+
+**Expected outcome:** The item appears in the list, the input clears, the counter shows "1 item left"
+```
+
+Clear steps, expected outcomes, nothing Playwright-specific. This works because the generator receives the plan and handles all the framework translation.
+
+For Selenium, the planner needed to do more work upfront. The reason is Cucumber's BDD format: a `.feature` file speaks Gherkin — `Given`, `When`, `Then`, `And` — and those sentences must match the step definitions exactly. If the plan uses imperative language ("click the login button") but the generator writes steps in BDD language ("When I click the Login button"), every generated step becomes a one-off translation decision. Multiplied across dozens of scenarios, the accumulated inconsistency makes the output harder to read and harder to maintain.
+
+The Selenium planner prompt adds explicit instructions to the standard structure:
+
+```markdown
+Each scenario must include:
+
+- Clear, descriptive title suitable for use as a Cucumber scenario name
+- Detailed step-by-step instructions written as Gherkin Given/When/Then steps where possible
+- Expected outcomes for each assertion step
+- Assumptions about starting state (always assume blank/fresh browser session)
+- Applicable Cucumber tags (e.g. `@smoke`, `@regression`, plus a page-level tag like `@contact`)
+- Success criteria and failure conditions
+```
+
+The plan that comes out of this describes the same application behaviour, but using BDD vocabulary:
+
+```markdown
+#### Scenario 1.1 — Valid credentials log in successfully
+
+**Tags:** @smoke @login
+**Given** I navigate to the Swag Labs login page
+**Then** the login form is displayed with username, password and login button
+**When** I log in as "standard_user" with password "secret_sauce"
+**Then** I am on the inventory page and the page heading reads "Products"
+**And** six product cards are visible
+```
+
+The other addition is a note on timing. The Playwright planner prompt has no equivalent instruction, because Playwright's `auto-waiting` handles most timing concerns automatically. Capybara also retries, but its defaults are different, and some AJAX patterns need an explicit `wait:` argument on the matcher. The Selenium planner adds: "Note any elements that require waiting (e.g. AJAX responses, animations) so the generator can add appropriate Capybara waits." This information travels from planner to generator inside the plan itself rather than being rediscovered during generation.
+
+## Part Two: The Generator - Two Files, No Generator Log
+
+This is where the adaptation is most substantial.
+
+The Playwright generator ends its workflow with two tool calls: `generator_read_log` to retrieve a record of every browser interaction it made, then `generator_write_test` to pass the generated TypeScript into Playwright's framework. The log contains tool names, arguments, and return values; `generator_write_test` understands the Playwright API and can translate those tool calls directly into test code.
+
+```
+generator_read_log  →  generator_write_test("test.describe(...) { test(..., async ({page}) => { ... }) }")
+```
+
+This approach doesn't exist for Ruby. There is no `generator_write_ruby_test`. More importantly, the output isn't a single TypeScript file — it's two text files: a Gherkin `.feature` file and a Ruby `_steps.rb` file. Neither Playwright's framework nor its MCP server knows anything about either format.
+
+The Selenium generator's solution is to skip the log entirely and write the files directly using the generic `Write` tool:
+
+```markdown
+After executing all steps, write two output files using the `Write` tool:
+
+1. A `.feature` file with a Cucumber `Scenario` (or `Scenario Outline` for data-driven cases)
+2. A `_steps.rb` file with the corresponding Ruby step definitions
+```
+
+This is a meaningful architectural difference. The Playwright generator can offload the translation concern to `generator_write_test`, the agent executes steps, reads back what it did, and passes the log to the framework which knows how to convert actions to test code. The Selenium generator must perform the translation itself, in its working memory, as it writes.
+
+That's why the generator's system prompt includes a translation table: something concrete to reason against rather than inventing Capybara syntax from scratch on each generation.
+
+### The Locator Translation Table
+
+When `browser_generate_locator` returns a selector, it returns it in Playwright syntax. `button:text("Submit")` is a valid Playwright locator. It is not valid Ruby. The Capybara equivalent is `click_button('Submit')` — a semantic action method, not a locator at all.
+
+The table makes this translation explicit:
+
+| `browser_generate_locator` output         | Preferred Capybara equivalent           |
+| ----------------------------------------- | --------------------------------------- |
+| `[name="email"]` or `input[type="email"]` | `fill_in('Email', with: value)`         |
+| `button:text("Submit")`                   | `click_button('Submit')`                |
+| `a:text("Home")`                          | `click_link('Home')`                    |
+| `[role="alert"]`                          | `find('[role="alert"]')`                |
+| `#error-msg`                              | `find('#error-msg')`                    |
+| `//input[@type='text']`                   | `find(:xpath, "//input[@type='text']")` |
+
+The preference ordering here matters. Capybara's `fill_in`, `click_button`, and `click_link` are _semantic_ finders — they locate elements by their label text, not their CSS structure. A `fill_in 'Email'` call will find the email input whether it has `id="email"`, `name="email"`, or is associated via an explicit `<label>` — because Capybara is matching against the accessibility tree, not the DOM structure. This makes the resulting tests more resilient to markup changes and easier for non-developers to read.
+
+Raw CSS and XPath are available as fallbacks for elements that have no semantic anchor, but the prompt explicitly discourages using them when a semantic finder exists.
+
+### What the Output Looks Like
+
+The login feature for [Swag Labs](https://www.saucedemo.com/) demonstrates the format. The `.feature` file groups all login scenarios under one `Feature:` block with a user story header:
+
+```gherkin
+@smoke @login
+Feature: Login
+  As a registered user
+  I want to log in with valid credentials
+  So that I can access the product inventory
+
+  Scenario: 1.1 - Valid credentials log in successfully
+    Given I navigate to the Swag Labs login page
+    Then the login form is displayed with username, password and login button
+    When I log in as "standard_user" with password "secret_sauce"
+    Then I am on the inventory page
+    And the page heading reads "Products"
+    And six product cards are visible
+
+  @regression
+  Scenario Outline: 1.3-1.4 - Invalid credentials are rejected with an error
+    Given I navigate to the Swag Labs login page
+    When I log in as "<username>" with password "<password>"
+    Then I see the error message "<error_message>"
+
+    Examples:
+      | username        | password      | error_message                                                             |
+      | standard_user   | wrongpassword | Epic sadface: Username and password do not match any user in this service |
+      | locked_out_user | secret_sauce  | Epic sadface: Sorry, this user has been locked out.                       |
+```
+
+The corresponding `login_steps.rb` translates each step into Capybara:
+
+```ruby
+Given('I navigate to the Swag Labs login page') do
+  visit 'https://www.saucedemo.com/'
+end
+
+Then('the login form is displayed with username, password and login button') do
+  expect(page).to have_field('Username')
+  expect(page).to have_field('Password')
+  expect(page).to have_button('Login')
+end
+
+When('I log in as {string} with password {string}') do |username, password|
+  fill_in 'Username', with: username
+  fill_in 'Password', with: password
+  click_button 'Login'
+end
+
+Then('I am on the inventory page') do
+  expect(page).to have_current_path('/inventory.html')
+end
+```
+
+Compare this with the equivalent Playwright output for a similar login scenario:
+
+```typescript
+test.describe("Scenario 1: Add a New Todo", () => {
+  test("should add a new todo item via the input form", async ({ page }) => {
+    const input = page.getByPlaceholder("What needs to be done?");
+    await input.click();
+    await input.fill("Buy groceries");
+    await page.getByRole("button", { name: "Add todo" }).click();
+
+    const todoItem = page
+      .getByRole("listitem")
+      .filter({ hasText: "Buy groceries" });
+    await expect(todoItem).toBeVisible();
+    await expect(input).toBeEmpty();
+    await expect(page.getByText("1 item left")).toBeVisible();
+  });
+});
+```
+
+Both outputs use semantic locators — `getByPlaceholder`, `getByRole` on the Playwright side; `fill_in`, `click_button`, `have_field` on the Capybara side. Both avoid raw CSS as a first choice. But the Gherkin format separates _what the test does_ (the `.feature` file) from _how it does it_ (the `_steps.rb` file), which is the BDD trade-off: more verbose, but readable by people who don't know Ruby, and reusable across scenarios without duplication.
+
+The `Scenario Outline` with an `Examples:` table is also worth noting. The Playwright project handles multiple input variations with a loop inside a single test; Cucumber's native mechanism is the `Scenario Outline`, which the generator uses automatically whenever the plan describes multiple data combinations for the same flow.
+
+### One File Rule: Don't Overwrite
+
+There's a structural difference in how the generator manages files over time. The Playwright generator creates one `.spec.ts` file per scenario — adding a scenario never touches an existing file.
+
+Cucumber step definitions are different. Step definitions are global: a step `When I log in as {string} with password {string}` defined in `login_steps.rb` can be used by any feature file in the project. The generator prompt reflects this:
+
+```markdown
+If a `_steps.rb` file for the area already exists, append new step definitions rather than
+overwriting it (use `Read` first to check).
+```
+
+This prevents the generator from clobbering steps that earlier scenarios added. It also means the step file grows incrementally and shared steps are naturally DRY — if two scenarios both need "I navigate to the Swag Labs login page", the step only needs to exist once.
+
+## Part Three: The Healer — Bundle Exec Over test_run
+
+The Playwright healer opens with `test_run` — a tool that launches the Playwright test runner and returns structured failure output. This is a framework-specific capability baked into the MCP server.
+
+There is no equivalent `test_run` for Cucumber. The Selenium healer runs tests the way any CI system would: via the shell.
+
+````markdown
+1. **Initial Execution**: Run all tests with Bash:
+   ```bash
+   bundle exec cucumber
+   ```
+````
+
+Capture the failure output to identify which scenarios and step definitions are broken.
+
+2. **Isolate each failure**: Re-run only the failing scenario to get a clean error trace:
+   ```bash
+   bundle exec cucumber features/<area>/<file>.feature:<line>
+   ```
+
+````
+
+The `Bash` tool — not available to the Playwright healer — is what makes this possible. The Playwright healer uses `test_debug` to pause execution at the point of failure and inspect the live browser. The Selenium healer uses `Bash` to isolate the failure, then uses `browser_navigate` and `browser_snapshot` to reach the same failure point manually. It's more steps, but the same information is available by the time the diagnosis phase starts.
+
+### The Capybara Timing Constraint
+
+One area where the healer's instructions diverge more sharply from the Playwright version is timing fixes. The Playwright healer can add `await page.waitForSelector(...)` or simply lean on Playwright's auto-wait. The Selenium healer has a stricter rule:
+
+```markdown
+- Only use `sleep` as a last resort — prefer Capybara's built-in retry via `have_*` matchers
+- Add `have_selector(..., wait: N)` if an element appears after a delay
+````
+
+Capybara retries `have_*` matchers automatically for up to two seconds by default. Adding `wait: 5` extends that timeout for slow operations. This is the right tool; `sleep N` is a fixed pause that slows every test run regardless of how fast the app responds. The Playwright healer has a similar instruction ("Never wait for networkidle or use other discouraged or deprecated APIs"), but the Capybara version is more specific because `sleep` is a more common antipattern in Ruby test suites.
+
+The healer also carries the same locator translation table as the generator, because `browser_generate_locator` will return Playwright-style selectors regardless of which agent calls it. When a locator breaks and the healer needs a replacement, it discovers the new selector via `browser_generate_locator`, then translates it to Capybara before writing the fix to `_steps.rb`:
+
+```markdown
+When `browser_generate_locator` returns a Playwright-style locator, translate it to Capybara:
+
+| `browser_generate_locator` output | Capybara equivalent                                    |
+| --------------------------------- | ------------------------------------------------------ |
+| `[name="field"]`                  | `fill_in('Label', with: ...)` or `find_field('Label')` |
+| `button:text("Submit")`           | `click_button('Submit')`                               |
+| `a:text("Link text")`             | `click_link('Link text')`                              |
+| `[role="alert"]`                  | `find('[role="alert"]')`                               |
+| `#css-id`                         | `find('#css-id')`                                      |
+| `//xpath`                         | `find(:xpath, '//xpath')`                              |
+```
+
+This table appears in both the generator and the healer. That duplication is intentional — neither agent can assume the other has already run, and both need to translate locators independently.
+
+### The @wip Escape Hatch
+
+The Playwright healer uses `test.fixme()` to mark a scenario that is genuinely broken on the application side rather than the test side. The Selenium healer uses Cucumber's `@wip` tag for the same purpose:
+
+```markdown
+- If a failure is caused by a genuine application bug (not a test bug), mark the scenario with
+  `@wip` and add a comment explaining the observed vs expected behaviour
+```
+
+`@wip` is a conventional Cucumber tag that most project configurations skip during CI runs. The healer adds the tag and leaves a comment in the step definition explaining the discrepancy — so the test documents the bug rather than being deleted or left silently failing.
+
+## The Tool Lists: A Concrete Diff
+
+One way to see all three agents' adaptations at a glance is the `tools:` frontmatter field in each agent definition. Both sets share a large common core, but the differences reveal the architectural choices:
+
+**Playwright generator tools** (unique to Playwright):
+
+- `mcp__playwright-test__generator_read_log` — reads the execution log
+- `mcp__playwright-test__generator_write_test` — writes TypeScript via the framework hook
+- `browser_verify_element_visible`, `browser_verify_list_visible`, `browser_verify_text_visible`, `browser_verify_value` — verification shortcuts
+
+**Selenium generator tools** (unique to Selenium):
+
+- `Write` — generic file write for `.feature` and `_steps.rb`
+
+**Playwright healer tools** (unique to Playwright):
+
+- `mcp__playwright-test__test_debug` — paused debugging mode
+- `mcp__playwright-test__test_list` — enumerate all tests
+- `mcp__playwright-test__test_run` — run the test suite
+- `MultiEdit` — multi-location edit in a single call
+
+**Selenium healer tools** (unique to Selenium):
+
+- `Bash` — shell access for `bundle exec cucumber`
+- `mcp__playwright-test__browser_navigate` — navigate to failure point manually
+- `mcp__playwright-test__browser_click`, `browser_type` — reproduce steps manually
+- `mcp__playwright-test__browser_network_requests` — inspect network activity
+
+The Playwright healer doesn't need `browser_navigate` or `browser_click` because `test_debug` navigates to the failure point automatically when it pauses. The Selenium healer needs to get there on foot. Conversely, the Playwright healer gets `test_run` and `test_debug` as integrated debugging tools that return structured failure data; the Selenium healer gets `Bash` and does the same thing through the command line.
+
+## Beyond Testing: What Else the MCP Tools Can Drive
+
+The diff above focuses on how the two pipelines approach the same job differently. But it also surfaces something else: roughly forty tools in the MCP server go untouched by either pipeline. The recording tools — `browser_start_video`, `browser_video_chapter`, `browser_stop_video` — have never been called. Neither have the annotation tools (`browser_annotate`, `browser_highlight`), the storage manipulation tools (`browser_cookie_set`, `browser_localstorage_set`, `browser_sessionstorage_set`), or the network control tools (`browser_route`, `browser_network_state_set`). The browser layer isn't just framework-agnostic; it's also use-case-agnostic. Four agents suggest themselves from the unused inventory.
+
+### A Demo Recording Agent
+
+`browser_start_video` begins a Playwright video recording of the current browser session; `browser_video_chapter` marks a named timestamp within it; `browser_stop_video` ends the recording and returns the file path. Combined with `browser_annotate` and `browser_highlight` — which draw overlays on the live page before a screenshot is taken — and `browser_pdf_save`, the server has everything needed to produce a narrated walkthrough of a web application without touching a screen recorder.
+
+An agent given a URL and a list of workflows ("add an item", "complete checkout", "view order history") would navigate each flow, call `browser_video_chapter` at the start of each, highlight key elements before interacting with them, and close the recording when done. The companion PDF would be a sequence of annotated screenshots — one per key step — saved in a single call to `browser_pdf_save`. The output: a demo video and a visual user guide from a single agent invocation.
+
+This is the category of documentation that currently gets produced by a developer screen-recording their own demo while narrating quietly into their laptop microphone at 4 PM on a Friday before a client call.
+
+### An API Contract / Mock Generator
+
+`browser_network_requests` returns the full list of network requests made during a browser session. `browser_network_request` retrieves the complete request and response for a specific entry, including headers, body, and status. `browser_route` intercepts future requests matching a URL pattern and returns a fixed response — Playwright's built-in mechanism for request mocking.
+
+An agent that navigates through an application and captures every XHR and fetch call with its request shape and response payload can produce two things: an API contract document listing each endpoint, method, and response schema; and a set of `browser_route` call fixtures for use in offline tests:
+
+```typescript
+await page.route("**/api/v1/products", (route) =>
+  route.fulfill({ status: 200, body: JSON.stringify(capturedResponse) }),
+);
+```
+
+For a backend team whose only available documentation is the running application, that contract document is immediately useful. For a test suite that needs to run in CI without a live backend, the fixtures remove the dependency entirely.
+
+### A Test State Seeder
+
+`browser_fill_form` submits an entire form's fields in a single call. `browser_cookie_set`, `browser_localstorage_set`, and `browser_sessionstorage_set` inject state directly into the browser without navigating through the UI to establish it. Between these tools, an agent can reach any application state through whichever path is fastest — UI flow for states the server validates, direct injection for states the client controls.
+
+The output is not the agent's interaction but what it generates at the end: a Cucumber `Before` hook or a Playwright `storageState` JSON file that reproduces the target state at the start of each test run in milliseconds:
+
+```ruby
+Before('@logged_in') do
+  page.driver.browser.manage.add_cookie(
+    name: 'session_id', value: 'abc123', domain: 'www.saucedemo.com'
+  )
+  visit '/inventory.html'
+end
+```
+
+This is directly applicable to the Selenium project here. Every scenario that includes `Given I am logged in as standard_user` currently pays the full cost of navigating to the login page, filling the form, clicking the button, and waiting for the inventory page to load. A seeder agent that discovers the session cookie format and generates the `Before` hook above runs that setup in one assignment.
+
+### An Offline / Degraded Network Tester
+
+`browser_network_state_set` is the only tool in the server with no analogue in any current agent. It sets the simulated network condition for the browser session: fully offline, or throttled to a specific bandwidth and latency (slow 3G, fast 3G, custom values). Combined with `browser_route` — which can intercept specific endpoints and return 500s, timeouts, or empty bodies on demand — an agent can test adverse network conditions without needing a real degraded network.
+
+The workflow maps cleanly onto the planner→generate pattern: the agent navigates through key user flows once under normal conditions (baseline), then repeats each flow under offline conditions, a 500 on the primary data endpoint, and a simulated 2G throttle. `browser_snapshot` and `browser_console_messages` capture the UI response at each point. The output is a report of what users actually see when things go wrong — whether error messages are surfaced gracefully, whether requests hang indefinitely, whether data entered before a connectivity loss is preserved. For applications with polling loops or real-time data feeds, this is the failure category most likely to be invisible in a passing test suite.
+
+## Key Takeaways
+
+**The MCP browser layer is genuinely portable.** The same `npx playwright run-test-mcp-server` command that drives Playwright test generation also drives Selenium test generation. If you already have the Playwright agent infrastructure, adapting it to a different test framework requires no infrastructure changes — only agent prompt changes.
+
+**BDD output requires a BDD-aware planner.** A framework-agnostic test plan works fine when the generator has complete freedom in how it phrases test steps. Once the output must be Gherkin — where step sentences must match step definitions exactly — the planner needs to produce BDD-shaped language from the start. Retro-fitting Gherkin phrasing at generation time produces inconsistent step names that accumulate technical debt.
+
+**Without generator_write_test, the translation table becomes load-bearing.** The Playwright generator can delegate framework translation to `generator_write_test`, which understands the Playwright API. The Selenium generator must translate Playwright locators to Capybara in working memory. The locator translation table in the system prompt is not documentation — it is the mechanism by which correct Capybara code gets written instead of Playwright-style code-in-Ruby.
+
+**Bash access transforms the healer's diagnostic loop.** The most significant capability difference between the two healers is `test_run`/`test_debug` versus `Bash`. `test_run` and `test_debug` return structured failure data tied directly to specific test locations. `Bash` with `bundle exec cucumber features/area/file.feature:10` achieves the same result through a longer path: run, capture output, parse line numbers, navigate manually. The healer can do it, but it costs turns.
+
+**Step reuse changes file management strategy.** Playwright tests are isolated: each `.spec.ts` file stands alone. Cucumber step definitions are shared: a step written for one scenario is available to all scenarios. This changes how the generator handles existing files — appending to `_steps.rb` rather than creating a new file — and it's why `Scenario Outline` is the right tool for data-driven tests rather than a loop inside a single test function.
+
+## The Code
+
+Both projects are on GitHub:
+
+- `Playwright_AI_Agents`: [github.com/pyardley/Playwright_AI_Agents](https://github.com/pyardley/Playwright_AI_Agents) — the original TypeScript pipeline with the Todo app
+- `SeleniumAgents`: [github.com/pyardley/SeleniumAgents](https://github.com/pyardley/SeleniumAgents) — the adapted pipeline targeting Ruby/Cucumber/Capybara
+
+The relevant files for the adaptation:
+
+- `.claude/agents/selenium-test-planner.md` — planner with Gherkin-aware output instructions
+- `.claude/agents/selenium-test-generator.md` — generator with the Capybara translation table and two-file output
+- `.claude/agents/selenium-test-healer.md` — healer using `Bash` and the locator translation table
+- `.mcp.json` — identical to the Playwright project
+- `features/` — generated Cucumber feature files and step definitions targeting [Swag Labs](https://www.saucedemo.com/)
+
+The Ruby stack requires `bundle install` from the `SelenuimWebdriver_Ruby` reference project before the generated tests can run. The agent infrastructure itself requires only Node (for `npx playwright run-test-mcp-server`) — no Ruby tooling is needed to generate the tests, only to execute them.
