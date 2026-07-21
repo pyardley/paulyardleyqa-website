@@ -1,0 +1,298 @@
+---
+title: "CorporateRAG Revisited: Query Rewriting, Reranking, and Knowing When to Say 'I Don't Know'"
+description: "Six upgrades to CorporateRAG since the original post — query rewriting, cross-encoder reranking, multi-modal image captioning, a lightweight entity graph, a semantic response cache, and a confidence gate that declines to answer rather than guess — plus a full walkthrough of the request/response pipeline that ties them together."
+pubDate: 2026-07-21
+author: "Paul Yardley"
+tags:
+  [
+    "RAG",
+    "PostgreSQL",
+    "pgvector",
+    "Jira",
+    "Confluence",
+    "SQL Server",
+    "Python",
+    "LangChain",
+    "Anthropic",
+    "Embeddings",
+  ]
+readingTime: "15 min read"
+draft: false
+---
+
+[The original CorporateRAG post](/blog/corporate-rag) described a system with one retrieval strategy: embed the question, run a filtered nearest-neighbour search in Pinecone, hand the top-k chunks to an LLM. It worked, but it had exactly one gear. Every question got the same treatment whether it was "what does SCRUM-29 say" (a lookup) or "compare the retry logic in the email ingestor to the Git ingestor" (a synthesis question spanning two sources) — and if retrieval came back with nothing but weak matches, the LLM answered anyway, because nothing in the pipeline knew how to say no.
+
+Since that post, the vector store itself moved from Pinecone to PostgreSQL + pgvector — vectors, auth, credentials, and access control now live in one database, with Row-Level Security enforcing the tenant boundary the application layer already builds. That migration is really its own story; this post is about six things that shipped on top of it, all as opt-in flags, all following the same rule the codebase already enforces for anything that touches ranking quality rather than security: **fail open**. If a rewrite call times out, if the reranker can't load, if the cache lookup errors — the turn degrades to what it would have done before the feature existed. Nothing new is allowed to turn a working turn into a broken one.
+
+The six additions:
+
+- **Query rewriting** — decompose multi-part questions into independent sub-queries before retrieval.
+- **Cross-encoder reranking** — a second, more expensive scoring pass that actually reads the chunk text against the query.
+- **Multi-modal image captioning** — architecture diagrams and error screenshots become searchable text at ingestion time.
+- **A lightweight entity graph** — "who else worked on tickets like this" answered by graph traversal, not vector similarity.
+- **A semantic response cache** — skip the whole pipeline, LLM included, for a question the same access-scope already asked.
+- **Corrective retrieval** — the fix for the "answered anyway" problem above: grade the best match, and decline honestly if it's weak.
+
+## The Request/Response Flow, End to End
+
+Before the individual features, here's what actually happens between a user hitting Enter in the chat box and an answer appearing, with all six flags on. This sequence lives almost entirely in `app/chat.py`'s `render_chat()`, with each stage delegating to its own module:
+
+```
+User types a question
+        │
+        ▼
+build_filter()               — resolve the user's accessible scopes into a WHERE-clause dict
+        │
+        ▼
+live_acl_check                — optionally re-validate those scopes against the live source system
+        │
+        ▼
+response_cache_check          — hash the *resolved* scopes + embed the question; hit? skip everything below
+        │  (miss)
+        ▼
+query_rewrite                 — one LLM call: is this one question or several independent ones?
+        │
+        ▼
+vector_retrieval               — retrieve() once per sub-query, concurrently, pooled and deduped
+        │
+        ▼
+rerank                         — cross-encoder re-scores the pooled candidates against the ORIGINAL question
+        │
+        ▼
+answer_question()             — corrective-retrieval gate first: is the top score even good enough to answer from?
+        │                        if yes → build context, call the LLM, return citations
+        │                        if no  → decline, no LLM call
+        ▼
+Answer + citations rendered, audit row + step timings persisted
+```
+
+Two things about this sequence are easy to miss reading the individual feature docs in isolation. First, the response cache check happens *before* query rewriting and retrieval, not just before the LLM call — a cache hit skips the embedding-and-reranking cost too, not only the token cost. Second, the corrective-retrieval gate sits inside `answer_question()` itself, not in `chat.py` — which means the MCP/hybrid path (live SQL queries bound as tools) never goes through it. A weak RAG match shouldn't block an answer that's actually going to come from a live database query.
+
+Here's the retrieval-and-rerank middle section as it's actually written, trimmed of the `StepTimer` bookkeeping:
+
+```python
+# app/chat.py
+top_k = settings.RERANK_CANDIDATE_K if settings.RERANK_ENABLED else None
+pooled: dict[tuple[str, int], RetrievedChunk] = {}
+with ThreadPoolExecutor(max_workers=len(sub_queries)) as pool:
+    futures = [
+        pool.submit(retrieve, q, filter_dict, top_k=top_k,
+                    user_id=user["id"], fts_language=state.fts_language)
+        for q in sub_queries
+    ]
+    for future in futures:
+        for hit in future.result():
+            key = (hit.resource_id, hit.chunk_index)
+            existing = pooled.get(key)
+            if existing is None or hit.score > existing.score:
+                pooled[key] = hit
+hits = list(pooled.values())
+
+hits = rerank(prompt, hits, top_n=settings.TOP_K)
+```
+
+`sub_queries` is `[prompt]` on 95% of turns — query rewriting is off by default and, even when it fires, most questions don't decompose. But the shape means a two-part question costs one round trip of wall-clock time, not two: the `retrieve()` calls run concurrently in a thread pool, and reranking always scores against the *original* prompt, never the synthetic sub-queries, so citation numbering and relevance stay tied to what the user actually asked.
+
+## Query Rewriting: One Question, Maybe Several Searches
+
+A question like _"compare X's retrieval quota to Y's caching approach"_ embeds into a single vector that's a blurry average of two unrelated concepts. Neither half retrieves well. `core/query_rewrite.py` adds one LLM call ahead of retrieval, using structured output to force a clean list:
+
+```python
+class _SubQueries(BaseModel):
+    sub_queries: list[str] = Field(
+        description=(
+            "1 to N standalone search queries. A single-item list "
+            "(the original question, unchanged) when no decomposition is needed."
+        )
+    )
+
+def rewrite_query(question: str) -> list[str]:
+    if not settings.QUERY_REWRITE_ENABLED or not question.strip():
+        return [question]
+    try:
+        llm = get_query_rewrite_llm().with_structured_output(_SubQueries)
+        result = llm.invoke([("system", _SYSTEM_PROMPT.format(...)), ("human", question)])
+        sub_queries = [q.strip() for q in result.sub_queries if q.strip()]
+        return sub_queries[: settings.QUERY_REWRITE_MAX_SUBQUERIES] or [question]
+    except Exception:
+        logger.warning("Query rewrite failed — falling back to the original question")
+        return [question]
+```
+
+The system prompt explicitly tells the model to preserve literal tokens — error codes, ticket keys like `PROJ-123`, function names — exactly as written, because the keyword side of hybrid retrieval depends on exact matches; a rewrite that "cleans up" `ABC123` into prose would quietly break FTS for that sub-query.
+
+I considered HyDE — embedding a hypothetical answer passage instead of the question — as the other well-known pre-retrieval technique, and didn't build it. HyDE would require threading a second "what to actually embed" parameter through `core/retriever.py`, since today it embeds and full-text-searches the identical string. Decomposition reuses the retriever and reranker completely unchanged; that made it the cheaper thing to ship first.
+
+## Cross-Encoder Reranking: Read the Chunk, Not Just Its Vector
+
+Cosine similarity between a query embedding and a chunk embedding is a bi-encoder score — the two texts are encoded completely independently and compared afterward. It's fast enough to run over an entire HNSW index, but it never actually reads the candidate chunk against the query. A cross-encoder does: it jointly encodes `(query, chunk_text)` and produces a single relevance score per pair, which is far more accurate but too slow to run over the whole corpus. The standard pattern is to use the cheap bi-encoder to fetch a wider candidate pool, then the expensive cross-encoder to re-score just those:
+
+```python
+# core/reranker.py
+def rerank(query: str, hits: list[RetrievedChunk], top_n: int) -> list[RetrievedChunk]:
+    if not settings.RERANK_ENABLED or not hits:
+        return hits[:top_n]
+    try:
+        model = get_reranker()
+        scores = model.predict([(query, hit.text) for hit in hits])
+        for hit, score in zip(hits, scores):
+            hit.score = float(score)
+        hits = sorted(hits, key=lambda h: h.score, reverse=True)
+    except Exception:
+        logger.exception("Reranking failed — falling back to retrieval order")
+    return hits[:top_n]
+```
+
+It runs `BAAI/bge-reranker-base` locally via `sentence-transformers`, on CPU, cached as a process-wide singleton after the first load. No new dependency, no API key, no per-query network cost — `sentence-transformers` was already a requirement for the HuggingFace embeddings fallback. The chat layer widens the candidate pool to `RERANK_CANDIDATE_K` (50, instead of the usual `TOP_K` of 8) specifically so the cross-encoder has something worth re-sorting.
+
+## Multi-Modal Ingestion: Making Screenshots Searchable
+
+Confluence pages and Jira tickets routinely carry the information that actually matters in an embedded screenshot — a stack trace, an architecture diagram, a log excerpt — none of which the text-chunking pipeline sees. `core/vision.py` closes that gap with a captioning prompt tuned for a very specific constraint: the caption is the *only* representation of the image that will ever be searched or shown to the LLM, so it can't be a vague description.
+
+```python
+_CAPTION_PROMPT = (
+    "Describe this image for a corporate knowledge-base search index. This "
+    "caption is the ONLY representation of the image that will be "
+    "searchable — nobody will ever see the image itself, only your text.\n\n"
+    "If the image contains a table, log output, code, or any other "
+    "structured/tabular data: transcribe it VERBATIM, in full — every row, "
+    "every column value, every timestamp and number exactly as shown. Do "
+    "not summarize or describe the columns instead of giving the values...\n\n"
+    "If the image is a diagram, screenshot, or architecture drawing "
+    "without tabular data, describe it concisely instead — components, "
+    "labels, error messages, and relationships shown."
+)
+```
+
+Getting this prompt right took an actual correction: an earlier version let the model summarize tables ("a table showing request latencies over time") instead of transcribing the actual numbers, which made the caption technically true and completely useless for the one question anyone would ask — "what was the p99 at 3pm". The fix was to be blunt about the constraint rather than trust the model to infer it.
+
+Each caption becomes one extra chunk alongside the resource's normal text chunks — not a parallel pipeline, not a separate index — tagged `metadata={"type": "image_caption", ...}` so it's indistinguishable from any other chunk at retrieval time. It's off by default: the email ingestor already made this call for attachments a while back ("too costly and risky" is the comment in that code), and a vision-LLM call per image is the same trade-off applied to Confluence and Jira. Two independent caps — `MAX_IMAGES_PER_RESOURCE` and `MAX_IMAGES_PER_INGESTION_RUN` — bound both a single huge page and an entire full re-ingest of a space.
+
+## A Lightweight Entity Graph, GraphRAG-Inspired
+
+Some questions aren't retrieval questions at all. "Who else has touched tickets related to this outage?" and "which repos does this author maintain?" aren't answered by finding chunks *similar* to the question — they need a graph traversal over *who did what*, which vector similarity has no way to express.
+
+`entity_edges` stores `(subject, predicate, object)` triples, and most of them cost nothing extra to collect: Jira's `assignee`/`reporter` and a Git commit's author are already sitting in API responses the ingestors fetch anyway.
+
+```python
+# core/entity_graph.py
+def upsert_edges(source, resource_identifier, source_resource_id, edges, *, user_id=None):
+    with get_db() as db:
+        set_current_user_for_rls(db, user_id)
+        db.query(EntityEdge).filter_by(source_resource_id=source_resource_id).delete()
+        for subject, predicate, obj, extraction_method in edges:
+            db.add(EntityEdge(source=source, resource_identifier=resource_identifier,
+                               source_resource_id=source_resource_id,
+                               subject=subject, predicate=predicate, object=obj,
+                               extraction_method=extraction_method))
+    return len(edges)
+```
+
+It's a delete-then-insert on every ingest, not an upsert-by-key, because edges don't have a stable per-row identity the way a chunk has `chunk_index` — an optional LLM extraction pass over free text can reasonably produce a different edge set run to run, so a re-ingest fully replaces the prior set rather than trying to diff it.
+
+The interesting design decision is where this gets *used*: not auto-injected into every RAG context, but exposed as an `entity_graph_query` MCP tool the LLM calls only when it decides a question actually needs graph traversal.
+
+```python
+# mcp_server/tools/entity_graph_tools.py — TOOL_SPECS entry
+"description": (
+    "Search the entity relationship graph for edges involving a person, "
+    "ticket, or repository — assigned_to, reported_by (Jira), modified_by "
+    "(Git), plus any LLM-extracted relationships. Use this for relationship "
+    "questions that plain text search can't answer, e.g. 'who else worked "
+    "on tickets like this one', 'who reported PROJ-123', or 'which repos "
+    "does alice@example.com maintain'."
+)
+```
+
+Git edges deliberately use the **repo scope** as the subject rather than the individual commit — every commit by the same author points at one repo-level node, which is what turns "which repos does X maintain" into a single query instead of one row per commit.
+
+## A Semantic Response Cache — Keyed By Access, Not By User
+
+The obvious way to cache RAG answers is by `user_id`: if Alice asked this before, serve Alice the cached answer. That's also the wrong way to get value out of a cache in a system where most users share most of their data — it means the tenth person on a team to ask the same onboarding question still pays for a full retrieval-plus-LLM turn, because nobody cached *for them* yet.
+
+`core/response_cache.py` keys on something else entirely: a fingerprint of the *resolved* accessible scopes actually used for retrieval.
+
+```python
+def scope_fingerprint(filter_dict: dict[str, Any], fts_language: str) -> str:
+    by_source: dict[str, list[str]] = (filter_dict or {}).get("by_source") or {}
+    canonical = {source: sorted(scopes) for source, scopes in sorted(by_source.items())}
+    payload = json.dumps({"by_source": canonical, "fts_language": fts_language}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+```
+
+Two users only ever share a cache hit when their resolved scopes are byte-identical — which, by construction, means they have access to exactly the same underlying data, so serving one user's cached answer to the other is provably safe. `user_id` is still stored on each row for audit purposes, but it plays no role in matching, which is what actually delivers the "whole team asks the same question over a week" scenario instead of a cache that's only useful to whoever asked first.
+
+The similarity threshold here is deliberately much stricter than anywhere else in the pipeline: `SCORE_THRESHOLD` (0.10) governs which chunks are worth *considering* for reranking, where a false positive just means a weak candidate got a look. `RESPONSE_CACHE_SIMILARITY_THRESHOLD` (0.97) governs whether an entire answer gets served verbatim, where a false positive is a wrong answer served with false confidence. In testing, two genuinely different phrasings of the same underlying question — "what is the meaning of life" vs. "what is the answer to life" — scored around 0.77, comfortably below the cutoff, which was reassuring evidence the threshold isn't so loose that real paraphrases collide.
+
+The cache check is also explicitly excluded from the MCP/hybrid path — live SQL data must never be served from a cache, full stop.
+
+## Corrective Retrieval: Admitting When Nothing Matches
+
+This is the one that closes the gap the original post's architecture always had. `answer_question()` already had a short-circuit for zero hits — if retrieval finds literally nothing, don't waste an LLM call pretending otherwise. But hits that exist and are all *weak* went straight to the LLM anyway, and a capable model asked to answer from marginal context will often produce something plausible-sounding rather than admit the context doesn't actually support an answer. Self-RAG and Corrective RAG (CRAG) call the missing piece a "grading" step, and it's a small enough addition that it fits in a couple of functions:
+
+```python
+# core/corrective_retrieval.py
+def is_low_confidence(hits: list[RetrievedChunk]) -> bool:
+    if not settings.CORRECTIVE_RETRIEVAL_ENABLED or not settings.RERANK_ENABLED or not hits:
+        return False
+    return hits[0].score < settings.CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD
+```
+
+```python
+# core/rag_chain.py — inside answer_question()
+if is_low_confidence(hits):
+    return _decline(
+        "I found some possibly related content, but nothing confident "
+        f"enough to answer from (top relevance score {hits[0].score:.2f} "
+        f"is below the {settings.CORRECTIVE_RETRIEVAL_SCORE_THRESHOLD:.2f} "
+        "confidence threshold). Try rephrasing your question, widening "
+        "your source selection in the sidebar, or running a fresh "
+        "ingestion pass.",
+        steps, retrieved_count=len(hits),
+    )
+```
+
+The gate that made this safe to write in an afternoon rather than a multi-day tuning exercise was already sitting in the codebase: `rerank()` sorts hits descending by its cross-encoder score, so `hits[0]` is always the strongest available evidence, and a single comparison against a threshold is enough — no need to average or vote across the whole candidate set.
+
+The one thing that genuinely needed checking rather than assuming was what scale that score is actually on. `BAAI/bge-reranker-base`'s raw output is a logit, unbounded and not obviously comparable to a fixed cutoff — a hardcoded `0.3` threshold would be meaningless against a value that could be `-4.2` or `11.7` depending on the pair. I inspected `sentence-transformers`' `CrossEncoder` source directly rather than trust memory on this:
+
+```python
+def get_default_activation_fn(self) -> Callable:
+    ...
+    if self.config.num_labels == 1:
+        return nn.Sigmoid()
+    return nn.Identity()
+```
+
+`bge-reranker-base` is a `num_labels=1` model, so `CrossEncoder.predict()` already applies a sigmoid by default — the score `rerank()` writes into `hit.score` is calibrated to `[0, 1]` and comparable across queries, which is exactly the property a fixed confidence threshold needs. That's also why the feature is written to no-op whenever `RERANK_ENABLED` is off: without reranking, `hit.score` is either a raw cosine similarity or an RRF fusion rank, neither of which sits on a fixed scale a single number can meaningfully gate.
+
+Like the response cache, this is scoped to the plain-RAG path only — `answer_question_with_mcp()` on the hybrid path is untouched, because a weak RAG match shouldn't block an answer a live SQL query is about to provide anyway.
+
+## Challenges Along the Way
+
+**The reranker score's scale wasn't documented anywhere in the codebase, and assuming wrong would have shipped a threshold that silently did nothing (or blocked everything).** The fix wasn't guessing or defaulting to "probably 0-1" — it was five minutes with `inspect.getsource()` against the actual installed library version to confirm `num_labels == 1` triggers a sigmoid. Cheap insurance against a config knob that looks reasonable and does nothing.
+
+**Per-source fairness in retrieval was a problem before any of these six features existed, but it shapes all of them.** `core/retriever.py` doesn't issue one global SELECT across every enabled source — it runs one query per source, each with its own candidate budget, specifically because a source with a dense neighborhood near the query embedding (thousands of similar marketing emails, say) can otherwise fill the entire HNSW candidate pool and leave nothing for a sparser but more relevant source like a SQL Server schema chunk. Query rewriting's pooled sub-query retrieval and reranking's wider candidate fetch both build on top of that guarantee rather than around it.
+
+**The response cache's tenancy model needed to be provably safe, not just probably safe.** The instinct is to key a cache by `user_id` — it's the identifier everywhere else in the system. Realizing that was the *wrong* boundary (it under-shares for a system where most users overlap in access) and that the *right* boundary is the resolved scope itself took working backwards from "when is it actually safe for two different people to see the same cached answer" rather than forward from "what field is already on this row."
+
+## Key Takeaways
+
+1. **"Fail open" only works if you actually check what "failed" looks like.** Every one of these six features degrades to pre-feature behaviour on error — but that's a design decision that has to be verified per feature (does a rerank exception really fall through to the un-reranked order? does a rewrite timeout really return `[question]`?), not assumed because the docstring says so.
+2. **A confidence threshold is only meaningful on a scale you've actually verified.** "It's probably 0 to 1" is not the same claim as "I read the library source and confirmed `num_labels=1` triggers a sigmoid." The former is a guess wearing the clothes of the latter.
+3. **Cache keys are a security decision, not a performance one.** The obvious cache key (`user_id`) and the correct one (resolved access scope) can produce identical-looking behaviour on every test you'd think to write, and only diverge on the exact scenario the cache exists to help with — a team sharing access asking overlapping questions.
+4. **Expensive, accurate scoring belongs after cheap, approximate retrieval — never instead of it.** Reranking's value depends entirely on the wider, cheaper candidate pool it's given to work with; ask a cross-encoder to score 50 candidates and it's a quality upgrade, ask it to score 50,000 and it's a latency regression.
+5. **"Admit you don't know" is a feature, not a fallback.** It's tempting to treat a low-confidence decline as a degraded experience compared to always answering. It's the opposite — a wrong answer stated confidently is strictly worse than an honest "I couldn't find a good match," and the latter is what actually earns trust in a tool people are meant to rely on for real work.
+
+## The Code
+
+The full source is at [github.com/pyardley/CorpRAGPostgres](https://github.com/pyardley/CorpRAGPostgres), in `rag-multi-source/`. The files most relevant to this post:
+
+- `core/query_rewrite.py` — multi-query decomposition
+- `core/reranker.py` — cross-encoder reranking
+- `core/vision.py` — image captioning for multi-modal ingestion
+- `core/entity_graph.py` / `mcp_server/tools/entity_graph_tools.py` — the entity graph and its MCP tool
+- `core/response_cache.py` — the scope-fingerprinted semantic cache
+- `core/corrective_retrieval.py` / `core/rag_chain.py` — the confidence gate and its integration into `answer_question()`
+- `app/chat.py` — the `render_chat()` sequence that ties all of the above together
+- `app/config.py` — every flag mentioned above, each off by default
