@@ -1,0 +1,256 @@
+---
+title: "OIA: Building a Standalone Oracle Impact-Analysis Tool, Then Debugging It Against CorporateRAG's Own Fixture"
+description: "CorporateRAG already traces SQL Server impact-analysis questions through a deliberately tricky fixture database. I built OIA — a standalone CLI tool doing the same job for Oracle, from scratch — then ported that exact fixture to PL/SQL and used CorporateRAG's own already-fixed tools as ground truth to compare against. The discrepancies caught four real bugs: a lineage parser reading the wrong AST node (twice), invisible WHERE-clause eligibility rules, a missing 'read the real source' tool, and a self-referencing Mermaid diagram."
+pubDate: 2026-08-01
+author: "Paul Yardley"
+tags:
+  [
+    "Oracle",
+    "PL/SQL",
+    "SQL Server",
+    "Python",
+    "Claude",
+    "Anthropic",
+    "Tool Use",
+    "Mermaid",
+  ]
+readingTime: "15 min read"
+draft: false
+---
+
+[CorporateRAG can already answer](/blog/corporate-rag-impact-analysis) SQL Server impact-analysis questions — "show how this report column is derived, trace it back to source tables" — by retrieving ingested schema chunks, walking a dependency graph, and pulling live object definitions on demand. That post ends with a specific, well-earned confidence: a fixture built with deliberate blind spots, three rounds of fixes, each one re-verified against a live database rather than trusted from the diff.
+
+This project asks the same question about Oracle, but doesn't ask it as a RAG feature. **OIA (Oracle Impact Analysis)** is a standalone CLI tool: no chunking, no retrieval, no "did the right passage get reranked into context." It extracts an Oracle schema's own data dictionary and PL/SQL source directly, builds a typed dependency graph with an explicit confidence score on every edge, and answers lineage/impact questions either through direct graph traversal or through a Claude agent that calls that graph as tools.
+
+To validate it, I didn't write a new test fixture. I took the *exact* `RetailReportingDemo` schema from the CorporateRAG post — the one engineered specifically so that a system giving a plausible-but-wrong answer would get caught — ported its tables, views, functions, procedures, and triggers to Oracle PL/SQL, and asked OIA the same lineage question CorporateRAG had already answered correctly. Then I used CorporateRAG's own already-fixed tools as ground truth to compare against.
+
+That comparison is where most of the real bugs in this post came from — not from reading my own code, but from noticing OIA's answer disagreed with a second, independently-built system asked the identical question about the identical business logic.
+
+## What OIA Actually Is
+
+The pipeline has three stages, each producing something the next one consumes:
+
+**Extraction** pulls `ALL_OBJECTS`, `ALL_TAB_COLUMNS`, `ALL_VIEWS`, `ALL_DEPENDENCIES`, `ALL_SOURCE`, `ALL_TRIGGERS`, and `ALL_CONSTRAINTS` into a local SQLite file — strictly `SELECT`, never DDL/DML against the target database.
+
+**Graph building** turns that raw metadata into a typed node/edge graph: object and column nodes, `REFERENCES` edges from foreign keys and `ALL_DEPENDENCIES`, and `DERIVED_FROM`/`READS_FROM`/`WRITES_TO`/`CALLS` edges from parsing view DDL and PL/SQL bodies with [sqlglot](https://github.com/tobymao/sqlglot). Every edge in that graph carries a `confidence` — `high` for a direct DDL parse, `low` for heuristically-harvested PL/SQL, `manual` for a human-supplied override, `none` for dynamic SQL nobody can statically resolve — and a `method` naming exactly how it was derived. Nothing is guessed silently; a gap that can't be resolved becomes an explicit `unresolved_lineage` row instead of a fabricated edge.
+
+**Querying** happens two ways. `oia trace`/`oia impact` are plain [NetworkX](https://networkx.org/) graph traversals — upstream to source columns, downstream to blast radius — degrading gracefully from column-level to object-level wherever parsing didn't reach. `oia ask` hands the same graph to a Claude agent as a set of tools (`search_objects`, `get_object_metadata`, `trace_column_lineage`, `impact_of_change`, and — added partway through this post — `get_object_source`), built on the Python SDK's `tool_runner` so the loop itself isn't hand-rolled. The system prompt is blunt about what the agent is and isn't allowed to do:
+
+```python
+# src/oia/agent/grounding.py
+- Only assert a lineage, impact, or reference relationship that appears in a
+  tool result. Never infer it from column-name similarity, table-naming
+  conventions, or general domain knowledge - if a tool didn't return it, it is
+  not part of your answer.
+- Every edge in a tool result carries a `confidence` (high/medium/low/manual/none)
+  and a `method`. Explicitly flag any part of your answer that depends on a
+  "low" or "none" confidence edge...
+```
+
+That grounding rule is the whole point of the confidence model existing in the first place — and, as it turned out, it's only as honest as the data underneath it.
+
+## Porting the Fixture
+
+`RetailReportingDemo`'s T-SQL objects translate to Oracle PL/SQL fairly mechanically — `GETDATE()` to `SYSDATE`, `#temp` tables to `WITH` CTEs, `ISNULL` to `NVL` — with one structural difference worth calling out. The original procedure builds `Report_CustomerChurnRisk` through a sequence of temp tables (`#ActiveCustomerOrders` → `#RFM` → `#Enriched` → scored insert); Oracle doesn't have session-scoped temp tables in the same casual way, so the port collapses that pipeline into a single `INSERT ... WITH cte1 AS (...), cte2 AS (...) SELECT ...` statement — same four logical stages, expressed as nested CTEs instead of throwaway tables:
+
+```sql
+-- database/04_procedures.sql
+CREATE OR REPLACE PROCEDURE USP_BUILDREPORT_CUSTOMERCHURNRISK
+IS
+BEGIN
+    USP_LOOKUPCUSTOMERSEGMENT();
+    EXECUTE IMMEDIATE 'TRUNCATE TABLE REPORT_CUSTOMERCHURNRISK';
+
+    INSERT INTO REPORT_CUSTOMERCHURNRISK (...)
+    WITH active_customer_orders AS (
+        SELECT c.CUSTOMERID, o.ORDERID, o.ORDERDATE,
+               FN_NETLINEAMOUNT(ol.QUANTITY, ol.UNITPRICE, ol.DISCOUNTPCT) AS NETAMOUNT
+        FROM CUSTOMERS c
+        JOIN ORDERS o ON o.CUSTOMERID = c.CUSTOMERID AND o.STATUS = 'Completed'
+        JOIN ORDERLINES ol ON ol.ORDERID = o.ORDERID
+        WHERE c.ISACTIVE = 1
+    ),
+    rfm AS (...),
+    enriched AS (...),
+    scored AS (...)
+    SELECT ... FROM scored;
+END;
+```
+
+Deploying it surfaced the first bug, and it wasn't in the SQL at all — it was in the deployment script. Every file in the port carries a `--` header comment before its first statement, and my split-by-`/`-delimiter parser folded that comment into the *same* chunk as the following `CREATE FUNCTION`. A guard meant to skip pure-comment chunks (`if stmt.startswith("--"): continue`) matched the whole merged chunk and silently skipped the entire first statement in every file — `FN_NETLINEAMOUNT`, `VW_ORDERLINEDETAIL`, two of the five triggers. Every object referencing one of those then failed with `ORA-00904: invalid identifier`, which looked like a dozen unrelated failures until I noticed they all traced back to something that was never created. The fix was to delete the guard — Oracle parses leading comments in a statement just fine; the guard was solving a problem that didn't exist and creating a worse one.
+
+Once everything deployed, I rollback-tested the two side-effecting triggers (`AFTER INSERT ON OrderLines` decrementing inventory at whichever regional warehouse has the most stock; `AFTER INSERT ON Returns` restocking whichever has the least) inside a transaction I never committed, confirmed the arithmetic landed on the right warehouse, and moved on to the actual comparison.
+
+## Round 1: The Formula That Went Missing Entirely
+
+First question, matching the CorporateRAG post's own opening move as closely as I could:
+
+> *Show how `REPORT_PRODUCTPERFORMANCE.MARGINPCT` is derived. Trace back to source tables.*
+
+OIA's answer: **no lineage found — this looks like a base column.** That's a real, distinct answer OIA gives when a column genuinely has no incoming `DERIVED_FROM` edge, and it's *supposed* to mean "nothing computes this." But `MARGINPCT` is very much computed, by exactly the kind of expression the ported procedure was full of:
+
+```sql
+CASE WHEN TotalRevenue = 0 THEN NULL
+     ELSE ROUND((TotalRevenue - TotalCost) / TotalRevenue * 100, 2)
+END
+```
+
+The bug: `sqlglot.lineage.lineage()` looks up an output column by name, and my code was passing it `out_expr.alias_or_name` — which is empty for an unaliased expression. Oracle's `INSERT ... SELECT` doesn't require aliasing a computed column (the `INSERT`'s own column list supplies the name positionally), so this `CASE` expression had no alias, and the lookup silently resolved to nothing. Not an error — an empty result, indistinguishable from "there's genuinely no lineage here."
+
+The fix forces every output expression to carry its real target-column name as an explicit alias in a throwaway copy of the query, before ever calling `lineage()`:
+
+```python
+# src/oia/lineage/plsql_lineage.py
+aliased_select = select.copy()
+aliased_select.set(
+    "expressions",
+    [
+        exp.alias_((e.this if isinstance(e, exp.Alias) else e).copy(), target_col, copy=False)
+        for target_col, e in zip(target_columns, output_cols, strict=True)
+    ],
+)
+```
+
+A regression test locks this in with the exact pattern that broke it — an unaliased `CASE` expression in an `INSERT ... SELECT` — rather than a case that happened to already have a name.
+
+## Round 2: The Formula That Came Back Garbled
+
+Fixing round 1 and re-running the *original* motivating question — the multi-stage `TotalNetAmount` derivation, the one the CorporateRAG post spent three phases getting right for SQL Server — didn't produce "no lineage." It produced lineage. It just wasn't a formula:
+
+```
+transform_expression: 'ORDERS O'
+transform_expression: 'STAGINGCUSTOMERSEGMENT S'
+```
+
+That's not a computation — it's a `FROM`-clause table alias, verbatim. I probed sqlglot's lineage tree directly to find out why:
+
+```python
+root = lineage('total_net_amount', sql, schema=schema, dialect='oracle')
+print('ROOT expression:', root.expression)
+# AGG.TOTAL_NET_AMOUNT AS TOTAL_NET_AMOUNT          <- a passthrough, not useful
+
+mid = root.downstream[0]
+print('MID expression:', mid.expression)
+# SUM(ACTIVE_ORDERS.NET_AMOUNT) AS TOTAL_NET_AMOUNT  <- the real computation
+
+leaf = mid.downstream[0]
+print('LEAF expression:', leaf.expression)
+# ACTIVE_ORDERS AS ACTIVE_ORDERS                      <- just the FROM-clause ref
+```
+
+I'd been reading `leaf.expression` — the node representing the base-table column itself — and treating it as "the transform that produced this value." It isn't; it's the leaf's own `FROM`-clause reference. The actual computation lives on the node *between* root and leaf, one hop closer to the leaf than the root. For a single-level query, root and that intermediate node are the same thing, which is exactly why the bug never showed up in any of my original fixtures — they were all single-hop.
+
+The fix walks the *whole* path from root to leaf, not just the endpoint, and joins every non-trivial expression along it:
+
+```python
+# src/oia/lineage/_common.py
+def lineage_leaves(node) -> list[tuple]:
+    """... returns (leaf, path) pairs - `path` is every node from the root
+    (inclusive) down to the leaf (inclusive)."""
+    out = []
+    stack = [(node, [node])]
+    while stack:
+        current, path = stack.pop()
+        if current.downstream:
+            stack.extend((child, [*path, child]) for child in current.downstream)
+        elif type(current.source).__name__ == "Table":
+            out.append((current, path))
+    return out
+```
+
+Re-extracting after the fix, the same edge now reads:
+
+```
+transform_expression: 'FN_NETLINEAMOUNT(OL.QUANTITY, OL.UNITPRICE, OL.DISCOUNTPCT) AS NETAMOUNT
+                        <- SUM(ACTIVE_CUSTOMER_ORDERS.NETAMOUNT) AS TOTALNETAMOUNT'
+```
+
+Both stages, innermost first — the per-line function call, then the aggregation applied to it.
+
+## Round 3: The Filter Neither System Started With
+
+Even with the formula right, `oia ask` still didn't mention that `TotalNetAmount` only counts orders from `ISACTIVE = 1` customers with `STATUS = 'Completed'`. This is, almost word for word, the same gap the CorporateRAG post opens its own bug list with — for the *same procedure*, independently, on a different database and a different codebase.
+
+The root cause was structural, not a parsing slip: OIA's graph tracked which columns fed a value, but never captured the `WHERE`/`JOIN...ON` conditions gating which *rows* counted. A new `filter_expression` field, populated the same way as the transform fix — walk the path, but collect `WHERE` and join conditions instead of computed expressions:
+
+```python
+# src/oia/lineage/_common.py
+if isinstance(n.source, exp.Select):
+    where = n.source.args.get("where")
+    if where is not None:
+        filters.append(where.sql(dialect=dialect))
+    for join in n.source.args.get("joins") or []:
+        on = join.args.get("on")
+        if on is not None:
+            filters.append(f"JOIN ON {on.sql(dialect=dialect)}")
+```
+
+That required a schema migration on a SQLite file that already existed — `ALTER TABLE graph_edges ADD COLUMN filter_expression TEXT`, checked defensively via `PRAGMA table_info` rather than assuming a fresh database, since this needed to run against the same graph I'd already built and queried all session.
+
+## Round 4: A Missing Tool, and a Diagram Pointing at Itself
+
+Two gaps left, both found the same way the CorporateRAG post found the case for a *mandatory* `sql_object_definition` rule: by noticing the agent had the right *facts* but not the right *evidence*.
+
+OIA's graph tracks that `FN_NETLINEAMOUNT` gets called and what arguments it's called with — but never the function's own body. Asked to confirm a formula, the agent could only reconstruct it from the call site, never quote it verbatim. CorporateRAG hit the mirror image of this: the tool existed but wasn't reliably *called*. OIA's version was a capability gap, not a usage gap — there was no tool to call at all. Same underlying lesson, arrived at from opposite directions: graph facts describe *that* a relationship exists; only the real source code proves *what* it computes.
+
+```python
+# src/oia/agent/tools.py
+@beta_tool
+def get_object_source(object_name: str) -> str:
+    """Get the actual PL/SQL source code (procedure/function/trigger body,
+    or the defining SELECT for a view). This is ground truth, not a
+    parser's approximation..."""
+    node_id = resolve_object(g, object_name)
+    source = sources.get(node_id)
+    if source is None:
+        return json.dumps({"node_id": node_id, "source": None, ...})
+    return json.dumps({"node_id": node_id, "source": source})
+```
+
+Backed by a `load_object_sources()` helper that pulls every procedure/function/trigger body and view-defining `SELECT` straight from the same raw extraction tables `oia extract` already populated — nothing new to fetch, just something new to expose.
+
+The last bug wasn't found by comparison at all — it was found by looking at a screenshot. Asked for a Mermaid diagram of the same lineage, the agent had drawn a node's own column list as edges pointing from the node back to itself:
+
+```mermaid
+REPORT -->|CUSTOMERID,CUSTOMERNAME<br/>SEGMENT,REGIONID| REPORT
+REPORT -->|TOTALNETAMOUNT| REPORT
+```
+
+Four arrows from a box to itself, rendered as exactly the nonsense that looks like. The fix is a rule, not code — Mermaid diagrams don't come from a deterministic renderer here, they come from the same agent composing prose, so the guard has to live in the system prompt:
+
+```
+- Never draw a self-loop (`NODE --> NODE`) to list a node's own columns or
+  attributes - it renders as a nonsensical arrow from a box to itself. Put
+  that information in the node's own label instead...
+```
+
+## Challenges Along the Way
+
+**Foreign keys silently vanished the first time I ran `oia extract` against the real database**, and the object graph came back with zero edges despite thirteen real FK constraints in the schema. The `node_ids` set used to validate an edge's endpoints was only ever populated for *object*-level nodes — the loop that built column nodes never added them to the same set, so every FK edge (which links column to column) failed its membership check and got silently dropped. `oia impact REGIONS` returning an empty result on a schema with real dependent tables was the tell; the fix was one missing line, `node_ids.add(cid)`, in the column-building loop.
+
+**The comment-skip bug came back a second time**, in a script I wrote *after* already debugging it once in the deploy script. `database/run_all.py`'s own statement parser had the identical failure mode — classifying a `FUNCTION`/`PROCEDURE`/`TRIGGER` by checking whether the raw statement text started with `CREATE OR REPLACE FUNCTION`, which fails the moment a header comment comes first, and this time the consequence was worse than a skip: it stripped the block's required closing semicolon, which would have produced a genuine Oracle syntax error rather than a silent no-op. I caught it this time with a dry run — parsing every object file without executing anything — specifically *because* I remembered the first occurrence and went looking for it, rather than waiting for a live failure to point at it again.
+
+**Rich's Windows console renderer crashed outright on the agent's own answer text.** The very first successful multi-hop trace produced an em dash in its prose, and `UnicodeEncodeError: 'charmap' codec can't encode character '→'` took the whole CLI down before printing a word of it — the legacy Win32 console path tries to encode via the system codepage (cp1252) rather than UTF-8. Forcing `Console(legacy_windows=False)` and reconfiguring stdout to UTF-8 fixed it; the more interesting part is that this was invisible in every test I'd written, because none of them render through an actual Windows terminal.
+
+**The Oracle side of the comparison started from a database with nothing to compare.** `RetailDemo`, the Oracle schema this tool had been built and tested against for most of the session, turned out to have zero views, procedures, functions, or triggers — nineteen plain tables, some of them pre-populated with exactly the kind of report data a procedure *would* produce, but no procedure in sight. Every lineage answer up to that point had legitimately been "no lineage found," and it had looked like the tool working correctly rather than the tool having nothing to parse. The port described above is what turned that into an actual test.
+
+## Key Takeaways
+
+1. **Two independently-built systems answering the same question is a sharper bug-finding tool than testing either one alone.** Neither the `MARGINPCT` alias bug nor the multi-hop `transform_expression` bug would have been obvious from reading OIA's code in isolation — both surfaced because the *answer* didn't match what a second, already-validated system said about the identical business logic.
+2. **A tree-walking library's leaf nodes aren't always the informative ones.** sqlglot's lineage leaves are base-table references by design — that's what makes them leaves — but the computation that matters lives on the nodes *between* root and leaf. Reading only the endpoint of a path is a natural first implementation and a real source of silently-wrong output.
+3. **"No lineage found" and "lineage exists but the lookup silently failed" are different bugs wearing the same symptom.** An unaliased SQL expression and a genuinely uncomputed base column produce the identical empty result from a name-based lookup — the fix wasn't better error handling, it was removing the ambiguity by never relying on an alias that might not exist.
+4. **A confidence score is only honest if the agent can go verify it.** Tagging an edge `low` confidence is the right call when a parser's best guess might be incomplete — but that's only trustworthy if there's also a way to check, on demand, against the real source rather than trusting the parser's reconstruction indefinitely.
+5. **A bug you already fixed once, in a script you're about to write again, is worth checking for on purpose.** The second comment-skip bug wasn't caught by better tooling — it was caught by deliberately looking for a known failure mode instead of waiting for the same live-failure signal to reappear.
+
+## The Code
+
+The full source is at [github.com/pyardley/OracleImpactAnalysis](https://github.com/pyardley/OracleImpactAnalysis). The files most relevant to this post:
+
+- `src/oia/lineage/_common.py` — the path-walking fix behind both the transform-expression and filter-expression bugs
+- `src/oia/lineage/plsql_lineage.py` — the unaliased-expression fix, and the INSERT...SELECT column-lineage logic generally
+- `src/oia/agent/tools.py` / `grounding.py` — the `get_object_source` tool and the Mermaid self-loop rule
+- `src/oia/graph/builder.py` — the FK-edge `node_ids` bug
+- `database/` — the ported `RetailReportingDemo` schema (tables, functions, views, procedures, triggers) and `run_all.py`, the orchestrator with the second comment-skip bug
+- `PROMPT.md` — the full architecture spec this was built from
+
+The SQL Server original this was validated against is at [github.com/pyardley/CorpRAGPostgres](https://github.com/pyardley/CorpRAGPostgres), described in full in [the CorporateRAG impact-analysis post](/blog/corporate-rag-impact-analysis) — the fixture, the three-phase fix, and the `Returns`/`RETURNS` keyword collision it caught along the way.

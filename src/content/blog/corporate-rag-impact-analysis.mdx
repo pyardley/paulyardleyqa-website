@@ -1,0 +1,211 @@
+---
+title: "CorporateRAG: Designing a Database to Break My Own RAG System (On Purpose)"
+description: "I asked Claude to write the prompt for a realistic SQL Server reporting database, engineered with deliberate blind spots, then used it to catch CorporateRAG giving a plausible-but-wrong answer to an impact-analysis question — and had Claude diagnose the root cause, plan three rounds of fixes, implement them, and verify each one against the live system rather than just the diff."
+pubDate: 2026-07-22
+author: "Paul Yardley"
+tags:
+  [
+    "RAG",
+    "PostgreSQL",
+    "pgvector",
+    "SQL Server",
+    "Python",
+    "LangChain",
+    "Anthropic",
+    "AI",
+  ]
+readingTime: "13 min read"
+draft: false
+---
+
+[CorporateRAG](/blog/corporate-rag) ingests SQL Server schema — tables, views, stored procedures, functions, triggers — so people can ask it things like "what breaks if I change this column?" That's a fundamentally different question from the lookup questions RAG is usually built for. A lookup question just needs the *most similar* chunk. An impact-analysis question needs the system to trace a dependency chain correctly and completely — every temp table, every join, every function it calls — and stop only when it actually runs out of graph to walk, not when it runs out of retrieved context.
+
+Testing that properly needed a schema that actually *had* multi-hop dependency structure worth tracing. So rather than write a toy fixture by hand, I asked Claude to write the **prompt** that would generate one — a realistic reporting database with tables, triggers, views and stored procedures, engineered specifically to have the kind of structure a shortcut-taking system would get wrong. What followed was a full loop, done properly: build the fixture, ask a real impact-analysis question against it, get a plausible-but-wrong answer, diagnose *why* rather than patch the symptom, turn the diagnosis into a phased plan, implement it, and — the part that's easy to skip — re-run the live system after each phase to check whether it actually worked.
+
+## Writing the Prompt, Not the Database
+
+The instruction I gave Claude wasn't "create a test database" — it was "write a prompt that specifies one," designed so the schema itself would only pass a correctness test if the tracing logic was genuinely correct, not merely plausible. The distinction that mattered most: three of five reporting procedures share a staging step, and one deliberately doesn't.
+
+```
+## Shared logic used by MULTIPLE report procedures (this is the important part)
+
+- usp_StageCompletedOrderLines(@StartDate, @EndDate) — filters
+  vw_OrderLineDetail down to Status='Completed' in the date range, writes
+  into a persisted staging table dbo.StagingCompletedOrderLines (truncate +
+  insert). This one staging procedure must be called by at least THREE of
+  the five report procedures below — that shared fan-in is the main thing
+  impact analysis should be able to discover.
+
+## Five report procedures ...
+
+4. usp_BuildReport_CustomerChurnRisk → Report_CustomerChurnRisk
+   filter: active customers, directly off Orders (not the shared staging —
+   this one should be independent)
+```
+
+That one clause — "this one should be independent" — is the whole test. A system that just paraphrases retrieved text can describe *a* dependency chain for the churn-risk procedure. Only a system that actually understands the graph can say "and unlike three of the other four reports, this one does *not* go through the shared staging step" — because saying that requires knowing what the *other* procedures do, not just this one.
+
+The prompt also flagged an intentional blind spot I'd found by reading the ingestion code first: at the time, the SQL ingestor didn't query trigger metadata at all (`INFORMATION_SCHEMA` has no view for triggers — that's a SQL Server catalog gap, not an oversight in the app). So the fixture asked for five triggers anyway, on the record, as a documented gap to test rather than something to quietly work around. (That gap got closed in an earlier round of work, before any of what follows — the ingestor now reads `sys.triggers` directly.)
+
+Executing that prompt produced `RetailReportingDemo`: 12 base tables, 5 triggers, 5 views (one layered on another), 2 shared helper objects, and 5 report procedures each populating its own output table, seeded with a few thousand rows of realistic-looking fake data.
+
+## The Answer That Looked Right and Wasn't
+
+With the fixture ingested, I asked CorporateRAG the question the whole design was built around:
+
+> *Show how Report_CustomerChurnRisk.TotalNetAmount is derived. Go right back to original source tables.*
+
+The real procedure runs four stages: a flat `#ActiveCustomerOrders` join (Customers + Orders + OrderLines, `fn_NetLineAmount` computing the net amount per line), an actual aggregation into `#RFM` (`SUM`/`COUNT`/`GROUP BY`), a `LEFT JOIN` against `StagingCustomerSegment` into `#Enriched` with `ISNULL(r.TotalNetAmount, 0)`, and a final scored insert. CorporateRAG's answer got the first two stages right, then went wrong in four specific ways:
+
+- It skipped `#Enriched` entirely, claiming `#RFM`'s value flowed straight into the report table — which hid both the `LEFT JOIN`'s `ISNULL`-to-zero semantics *and* a second read of `Customers` via the segment lookup.
+- It described `#ActiveCustomerOrders` — a flat, non-aggregated join — as "aggregating."
+- It named `fn_NetLineAmount` without ever showing what it actually computes.
+- It never mentioned that this procedure's path is deliberately independent of the shared staging procedure the other reports use.
+
+Every one of those four gaps maps directly onto a structural feature I'd deliberately built into the fixture. That's not a coincidence — it's the fixture doing its job.
+
+## From Critique to Root Cause
+
+I didn't want a patch for this one output. Rather than asking Claude to "fix the answer," I asked it to research *why* — three parallel investigations into chunking, retrieval, and the existing MCP/entity-graph infrastructure, before proposing anything. The findings, verified against the actual code, not guessed at:
+
+- The generic text splitter chunks at ~1,000 characters with zero SQL awareness. The churn-risk procedure's own body had split across five separate chunks with no guarantee they'd all survive to the same reranked context.
+- Retrieval caps at eight chunks post-rerank, and nothing guarantees every object that references a given table or function makes that cut — `fn_NetLineAmount` had scored well enough to retrieve, then been crowded out by a loosely-related sibling report.
+- There was no dependency graph for SQL objects at all. The one live-SQL tool the chat could call only ran ad-hoc `SELECT`s against business data — nothing about schema or dependencies.
+- The system prompt had zero language instructing the model to trace hop-by-hop, open up called functions, or flag an incomplete trace.
+
+That turned into a written plan, phased into three rounds: cheap prompt/retrieval fixes first, a static dependency graph second, live schema-introspection tools third — each phase re-tested against the live database before moving to the next.
+
+## Phase 0: Cheap Fixes, and a Bug I Only Found by Running It
+
+The first round was deliberately low-risk: reassemble a SQL object's chunks into one block before the LLM sees it, add explicit tracing rules to the system prompt, and add a deterministic post-answer check — collect every SQL object name and temp-table token shown to the model, flag any that never show up in the final answer.
+
+The first version of that check was itself wrong, and a live test proved it immediately: on the exact churn-risk question, it flagged an unrelated sibling procedure's own internal temp tables — and its own name — as "missing," on an answer that had *correctly* ignored them, because they'd only retrieved on loose vocabulary overlap. Treating "every object shown to the model" as "every object that should be mentioned" doesn't distinguish real dependencies from retrieval noise. The fix narrows the candidate set to whatever the single highest-scored SQL hit's own text actually references:
+
+```python
+# core/trace_completeness.py
+def _candidate_names(hits: list[RetrievedChunk]) -> set[str]:
+    sql_hits = [
+        h
+        for h in hits
+        if h.source == "sql" and (h.metadata or {}).get("object_type") != "live-mcp"
+    ]
+    if not sql_hits:
+        return set()
+
+    anchor = sql_hits[0]
+    anchor_text = anchor.text or ""
+    anchor_name = (anchor.metadata or {}).get("object_name")
+
+    names: set[str] = set(_TEMP_TABLE_RE.findall(anchor_text))
+    for hit in sql_hits:
+        object_name = (hit.metadata or {}).get("object_name")
+        if not object_name or object_name == anchor_name:
+            continue
+        if object_name in anchor_text:
+            names.add(object_name)
+    return names
+```
+
+Before the fix, the footer on a correct answer read: *"objects present in the source but not mentioned above: #Enriched, #RegionPeriodAgg, #RegionSegmentAgg, dbo.usp_BuildReport_CustomerChurnRisk, dbo.usp_BuildReport_MonthlySalesByRegion, dbo.vw_CustomerOrderSummary."* Four of those six were noise. After anchoring on the top-scored object and requiring a literal textual reference, the same answer produced exactly one flag: *"#Enriched."* That one was real — the answer had discussed the enrichment join in prose without ever using its literal name, which is precisely the class of gap this check exists to catch.
+
+## Phase 1: A Dependency Graph, and a Bug Found on the Way
+
+Phase 1 built an actual static dependency graph: at ingestion time, scan each object's definition for references to every other known object in the same database, and persist the edges. Predicate classification is simple — `calls` for procedures/functions, `writes_to` for anything targeted by `INSERT`/`UPDATE`/`MERGE`/`TRUNCATE`, `references` otherwise — but the graph is only as good as knowing every real object name up front, which meant refactoring the ingestor into a fetch pass (build the whole-database catalog first) and a build pass (scan each object's text against that catalog).
+
+While wiring the new graph into the existing entity-relationship tooling, I found a bug that had nothing to do with SQL at all: `entity_graph_query` — a tool for querying Jira/Git relationships, built in an earlier round — was bound to the LLM as an available tool, but the manual tool-call dispatcher in the chat loop had no branch for it. Every call to it would have silently returned "unknown tool." It had simply never been exercised end-to-end before. Fixed alongside the new `sql_dependency_graph` tool, since both are graph-lookup calls sharing the same dispatcher.
+
+Verified against the live fixture, the static graph produced exactly the expected edges for the churn-risk procedure — `calls` → `fn_NetLineAmount` and `usp_LookupCustomerSegment`, `references` → `Customers`/`Orders`/`OrderLines`/`StagingCustomerSegment`, `writes_to` → `Report_CustomerChurnRisk` — and a downstream traversal of the shared staging procedure returned exactly three of the five report procedures. `usp_BuildReport_CustomerChurnRisk` correctly never appeared. The independent-path fact the fixture was built to test was now something the system could actually discover, not just something I knew was true because I'd written the SQL.
+
+Re-asking the motivating question through the live chat pipeline showed real, partial progress: the model called the new tool unprompted and, for the first time, narrated `#Enriched`'s actual `LEFT JOIN`/`ISNULL` code. It still never opened up `fn_NetLineAmount` — because the static graph proves an edge *exists*, but never returns the callee's actual body, and `fn_NetLineAmount` still wasn't making the top-8 retrieved chunks. The tool told the model what *should* be true; it couldn't make the model say something whose content was never in front of it.
+
+## Phase 2: Live Tools, a Tuning Problem, and a Bug the Tools Themselves Found
+
+Phase 2 added two tools that talk to the live database instead of the ingested copy: `sql_object_definition`, which fetches a complete, unchunked object body on demand, and `sql_object_dependencies`, which walks SQL Server's own dependency DMVs (`sys.dm_sql_referenced_entities` / `sys.dm_sql_referencing_entities`) hop by hop, supplemented by the same static text-search as a fallback for what those DMVs miss.
+
+Called directly, `sql_object_definition` returned exactly what it should:
+
+```
+**dbo.fn_NetLineAmount** (function):
+
+CREATE   FUNCTION dbo.fn_NetLineAmount(@Quantity INT, @UnitPrice DECIMAL(10,2), @DiscountPct DECIMAL(5,2))
+RETURNS DECIMAL(12,2)
+AS
+BEGIN
+    RETURN CAST(@Quantity AS DECIMAL(12,2)) * @UnitPrice * (1 - (@DiscountPct / 100.0));
+END;
+```
+
+But two full runs of the real chat pipeline showed the model calling `sql_object_dependencies` enthusiastically — chaining multiple calls on its own, walking two and three hops upstream — and never once calling `sql_object_definition`. In the worse of the two runs, it spent its entire tool budget confirming graph structure and reached its final answer having lost the `#Enriched` narration Phase 1 had already achieved. Having the right tool clearly wasn't the same as the model choosing to use it.
+
+The fix was two changes together: raising the tool-call hop budget (four wasn't enough room for both dependency exploration *and* opening a function), and making the instruction to call `sql_object_definition` a mandatory, failure-framed rule rather than a soft suggestion buried in a longer paragraph:
+
+```
+MANDATORY rule for any function or procedure that computes a value
+inline (anything you'd otherwise just name, e.g. "NetAmount is computed
+via fn_NetLineAmount"): you MUST call `sql_object_definition` on it and
+quote its actual formula/logic in your answer. This is a SEPARATE step
+from checking dependencies — confirming a function is *called* via
+`sql_object_dependencies`/`sql_dependency_graph` does NOT satisfy this
+rule, and stopping there is a failure. Do this even if the RAG context
+excerpt looks complete, and even if you've already spent several tool
+calls on dependency lookups — budget the remaining hops for it. Before
+writing your final answer, check: for every function/procedure named
+in your draft, did you actually call `sql_object_definition` on it? If
+not, call it now, before responding.
+```
+
+After that change, two more live runs both called `sql_object_definition` and both quoted the exact formula in the final answer. But the second of those runs surfaced something neither prompt engineering nor code review would have caught: the answer stated, as fact, that `fn_NetLineAmount` "references `dbo.Returns`." The function is a pure scalar calculation with no table access at all — that was wrong, and it hadn't come from the model. The tool itself had said it.
+
+The bug was in the same text-fallback matcher from Phase 1. `fn_NetLineAmount`'s own definition contains the line `RETURNS DECIMAL(12,2)` — its return-type declaration — and the fixture's schema happens to have a real table named `dbo.Returns` (for tracking product returns). A bare word-boundary match on "Returns" doesn't know the difference between a T-SQL keyword and a table name; it matched the keyword. The fix restricts bare (unqualified) matches to only count when they directly follow an actual referencing keyword:
+
+```python
+# core/sql_dependency_extraction.py
+schema, _, bare_name = key.partition(".")
+
+qualified_found = bool(
+    re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text, re.IGNORECASE)
+)
+bare_found = False
+if not qualified_found and schema == "dbo":
+    bare_found = bool(
+        re.search(
+            rf"\b(?:{_BARE_REFERENCE_KEYWORDS})\s+\[?{re.escape(bare_name)}\]?(?!\w)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+```
+
+Schema-qualified matches (`dbo.Returns`) needed no change — a keyword is never preceded by a schema name in valid T-SQL. Since this function is shared by both the ingestion-time graph builder *and* the live tool's fallback, fixing it once closed the bug in both places — but the ingestion-time graph had already written the bad edge to the database under the old code, which meant a re-ingest was needed before the fix was actually complete, not just correct in source.
+
+## Challenges Along the Way
+
+**The completeness checker's first version was itself a false-positive generator**, and the only reason I know that is because I ran it against a real answer instead of trusting the logic on paper. Anchoring on the single highest-scored hit — rather than treating every retrieved object as equally relevant — turned six flagged names (four of them noise) into exactly one (a real gap).
+
+**Setting up a test user turned into a small lesson in not reusing accounts carelessly.** My first attempt at `create_user()` silently no-opped because a user with that email already existed — my own real account — so the ingestion CLI's authentication check failed against a password I'd just invented for a brand-new user that was never actually created. The fix was a dedicated test account, not touching a real one.
+
+**A 3,781-line README diff turned out to be 121 real lines and a line-ending mismatch.** The file's committed version used CRLF; the working copy had drifted to LF from an earlier edit. Committing as-is would have made every unchanged line in the file look modified. Normalizing the line endings back to the file's existing convention before staging kept the diff — and the eventual `git blame` — honest.
+
+**The keyword-collision bug above only existed because I tested against a live database with realistic-sounding names**, not a minimal synthetic example. A fixture table literally named `Returns` is exactly the kind of ordinary business terminology that collides with SQL syntax in ways a hand-picked test case (`dbo.Foo`, `dbo.Bar`) never would have surfaced.
+
+## Key Takeaways
+
+1. **A test for "does this system trace structure correctly" needs test data that actually has the structure to trace.** A fixture with one shared dependency and one deliberately independent path is a sharper test than a handful of unrelated tables — and asking the AI to write the *generation prompt*, with those properties spelled out explicitly, is a more reliable way to get that structure than hand-writing a schema and hoping it's representative.
+2. **Building a capability and getting it used are two different problems.** `sql_object_definition` existed, was correct, and was available for two full runs before the model reliably called it — closing that gap took a larger tool-call budget *and* a mandatory, failure-framed instruction, not just the tool itself.
+3. **The bugs worth finding are usually the ones you can only find by running the thing.** A false-positive completeness checker, a dead branch in a tool dispatcher, and a keyword/table-name collision all surfaced from executing the real pipeline against a live database — none of them were visible from re-reading the diff.
+4. **Fix the shared root cause, and remember the data it already wrote.** The `RETURNS`/`Returns` bug lived in one function used by both the ingestion-time graph and the live tool's fallback, so fixing it once closed both — but the already-ingested graph had the bad edge baked in, and needed a re-ingest before the fix was actually in effect anywhere.
+5. **Separate "diagnose" from "prescribe," and re-test after every phase.** Asking for root-cause research before a plan, and re-running the live system after each phase instead of after the whole plan, caught problems — the noisy completeness checker, the unused tool, the keyword collision — that a single "implement the fix" request would have shipped without anyone noticing.
+
+## The Code
+
+The full source is at [github.com/pyardley/CorpRAGPostgres](https://github.com/pyardley/CorpRAGPostgres), in `rag-multi-source/`. The files most relevant to this post:
+
+- `fixtures/sql-server-impact-analysis-prompt.md` — the prompt that generated the test fixture
+- `fixtures/sql/*.sql` — the generated schema, triggers, views, and report procedures
+- `core/sql_dependency_extraction.py` — static reference extraction, including the keyword-collision fix
+- `core/trace_completeness.py` — the anchor-based post-answer completeness check
+- `core/sql_object_context.py` — chunk reassembly and dependency-based forced inclusion
+- `mcp_server/tools/sql_schema_tools.py` — the live `sql_object_definition` / `sql_object_dependencies` tools
+- `mcp_server/tools/entity_graph_tools.py` — the static graph traversal tool, and the dispatcher fix
+- `core/mcp_chain.py` — the strengthened tracing prompt and tool-call dispatch
+- `tests/test_sql_dependency_extraction.py` — the first tests in the repo, including the regression case for the `Returns` collision
