@@ -75,3 +75,67 @@ html {
   border-radius: 0 !important;
   font-size: inherit !important;
 }
+
+/* Page transitions (Astro View Transitions): fade + direction-aware horizontal slide */
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes slide-to-left {
+  to {
+    transform: translateX(-24px);
+    opacity: 0;
+  }
+}
+@keyframes slide-from-right {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+}
+@keyframes slide-to-right {
+  to {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+}
+@keyframes slide-from-left {
+  from {
+    transform: translateX(-24px);
+    opacity: 0;
+  }
+}
+
+::view-transition-old(root) {
+  animation: 200ms cubic-bezier(0.4, 0, 0.2, 1) both fade-out;
+}
+::view-transition-new(root) {
+  animation: 300ms cubic-bezier(0.4, 0, 0.2, 1) both fade-in;
+}
+
+html[data-astro-transition="forward"]::view-transition-old(root) {
+  animation: 200ms cubic-bezier(0.4, 0, 0.2, 1) both slide-to-left;
+}
+html[data-astro-transition="forward"]::view-transition-new(root) {
+  animation: 300ms cubic-bezier(0.4, 0, 0.2, 1) both slide-from-right;
+}
+html[data-astro-transition="back"]::view-transition-old(root) {
+  animation: 200ms cubic-bezier(0.4, 0, 0.2, 1) both slide-to-right;
+}
+html[data-astro-transition="back"]::view-transition-new(root) {
+  animation: 300ms cubic-bezier(0.4, 0, 0.2, 1) both slide-from-left;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}
