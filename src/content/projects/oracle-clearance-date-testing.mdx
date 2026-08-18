@@ -1,0 +1,183 @@
+---
+title: "Working-Day Date Logic Looks Easy Until Easter and Christmas Show Up"
+description: "A reusable Oracle pattern for verifying 'N working days from today' business rules - like payment clearance dates - by driving both the calculation and the test cases off a single calendar reference table, so weekends, moving Easter dates and Christmas/Boxing Day substitutes only have to be handled once."
+industry: "Car Finance"
+role: "Test Analyst"
+duration: "Project-based"
+tools: ["Oracle SQL", "PL/SQL", "SQL*Plus"]
+scope:
+  [
+    "Business Rule Verification",
+    "Date/Calendar Logic",
+    "Test Data Design",
+    "Test Automation",
+  ]
+order: 4
+results:
+  - metric: "Test Scenarios"
+    value: "10, covering weekends, Easter and Christmas/Boxing Day"
+  - metric: "Bank Holidays Modelled"
+    value: "11 UK dates across 2026-2027"
+  - metric: "Deliberate Failures Seeded"
+    value: "3 of 10, to prove the Pass/Fail check actually works"
+---
+
+"Three working days after the transaction date" sounds like a one-line calculation - add three, done. It isn't. Weekends need skipping. Bank holidays shift every year. Easter moves around the calendar by a full month depending on the year. And when Christmas Day or Boxing Day lands on a weekend, the substitute days that replace them land on whatever weekday happens to follow - sometimes a single Monday, sometimes a Monday-and-Tuesday pair. Any system that promises a customer a **clearance date** - the date a payment, cheque or transaction is confirmed - has to get every one of those cases right, and "looks right for the dates I happened to test" isn't good enough.
+
+I used this pattern at Solifi to verify clearance-date calculations on a car finance/loan management platform. The code here isn't that production code - it's a self-contained reconstruction built for this portfolio - but the pattern is identical: put all the calendar knowledge (weekends, bank holidays, substitute days) into one reference table, drive the business function off that table, then drive the test cases off it too. When the function and the tests share a single source of truth for "is this a working day," there's nothing left to disagree about except the logic itself.
+
+## The Technique: One Table, Everything Else Follows
+
+### 1. A Calendar Reference Table
+
+`calendar_days` holds one row per date, with a working-day flag and, where relevant, the name of the bank holiday:
+
+```sql
+CREATE TABLE calendar_days (
+    cal_date     DATE          NOT NULL,
+    week_day     VARCHAR2(9)   NOT NULL,
+    working_day  NUMBER(1)     NOT NULL,   -- 1 = working, 0 = weekend/holiday
+    day_comment  VARCHAR2(50),             -- bank holiday name, else NULL
+    CONSTRAINT pk_calendar_days PRIMARY KEY (cal_date),
+    CONSTRAINT ck_calendar_days_wd CHECK (working_day IN (0, 1))
+);
+```
+
+It's populated with a `CONNECT BY` date generator joined against a list of UK bank holidays, so weekends and holidays are both flagged in a single pass:
+
+```sql
+WITH bank_holidays AS (
+    SELECT DATE '2026-08-31' AS hol_date, 'Summer bank holiday'     AS hol_name FROM dual UNION ALL
+    SELECT DATE '2026-12-25', 'Christmas Day'                                   FROM dual UNION ALL
+    SELECT DATE '2026-12-28', 'Boxing Day (substitute)'                        FROM dual UNION ALL
+    -- ... every other bank holiday in the covered range
+),
+date_range AS (
+    SELECT DATE '2026-08-18' + LEVEL - 1 AS cal_date
+    FROM dual
+    CONNECT BY DATE '2026-08-18' + LEVEL - 1 <= DATE '2027-12-31'
+)
+SELECT d.cal_date,
+       TO_CHAR(d.cal_date, 'fmDay', 'NLS_DATE_LANGUAGE=ENGLISH'),
+       CASE
+           WHEN TO_CHAR(d.cal_date, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT','SUN') THEN 0
+           WHEN b.hol_date IS NOT NULL THEN 0
+           ELSE 1
+       END,
+       b.hol_name
+FROM date_range d
+LEFT JOIN bank_holidays b ON b.hol_date = d.cal_date;
+```
+
+Anyone - not just a developer - can query this table and eyeball whether a given date is flagged correctly. That matters: a calendar is a business fact, not an implementation detail, and it should be reviewable as one.
+
+### 2. A Function That Trusts the Table
+
+`get_clearance_date` never touches a weekend or a holiday list directly. It asks the calendar table for the third working day after the input date:
+
+```sql
+CREATE OR REPLACE FUNCTION get_clearance_date (
+    p_input_date IN DATE
+) RETURN DATE
+IS
+    v_clearance_date DATE;
+BEGIN
+    SELECT cal_date
+    INTO v_clearance_date
+    FROM (
+        SELECT cal_date, ROW_NUMBER() OVER (ORDER BY cal_date) AS rn
+        FROM calendar_days
+        WHERE cal_date > TRUNC(p_input_date)
+          AND working_day = 1
+    )
+    WHERE rn = 3;
+
+    RETURN v_clearance_date;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20001,
+            'calendar_days does not extend far enough past ' ||
+            TO_CHAR(TRUNC(p_input_date), 'DD-MON-YYYY'));
+END get_clearance_date;
+/
+```
+
+If the rule ever changes from "3 working days" to "5," or a second calendar (say, a different territory's holidays) needs supporting, that's a one-line change here - the calendar logic itself stays untouched.
+
+## Testing It: Target the Boundaries, Not the Average Day
+
+A single test against an ordinary Tuesday proves almost nothing - there's no weekend or holiday anywhere near it for the logic to get wrong. The scenarios that actually find defects are the ones sitting right on a boundary: the Friday before a bank holiday Monday, the day before a four-day Easter closure, the run-up to Christmas where a weekend and two substitute holidays stack back to back.
+
+| Scenario                                    | Transaction Date  | Correct Clearance Date | Why It's Tricky                                            |
+| -------------------------------------------- | ------------------ | ------------------------ | ------------------------------------------------------------ |
+| Baseline                                    | 01-Sep-2026 (Tue) | 04-Sep-2026 (Fri)      | Control case - no interruptions                             |
+| Weekend crossing                            | 03-Sep-2026 (Thu) | 08-Sep-2026 (Tue)      | One weekend inside the count                                |
+| Weekend + Summer bank holiday               | 28-Aug-2026 (Fri) | 03-Sep-2026 (Thu)      | Weekend runs straight into a Monday bank holiday            |
+| Christmas Day + weekend + Boxing Day sub    | 23-Dec-2026 (Wed) | 30-Dec-2026 (Wed)      | Three consecutive non-working days in a row                 |
+| New Year's Day + weekend                    | 29-Dec-2026 (Tue) | 04-Jan-2027 (Mon)      | Holiday sits immediately before a weekend                   |
+| Good Friday / Easter Monday                 | 24-Mar-2027 (Wed) | 31-Mar-2027 (Wed)      | Four-day closure (Fri-Mon) mid-week                          |
+| Early May bank holiday                      | 30-Apr-2027 (Fri) | 06-May-2027 (Thu)      | Bank holiday Monday directly after the weekend               |
+| Spring bank holiday                         | 28-May-2027 (Fri) | 03-Jun-2027 (Thu)      | Same shape, different month                                  |
+| Summer bank holiday                         | 27-Aug-2027 (Fri) | 02-Sep-2027 (Thu)      | Same shape, following year                                   |
+| Christmas/Boxing Day subs fall on a weekend | 23-Dec-2027 (Thu) | 30-Dec-2027 (Thu)      | Actual holidays land on Sat/Sun; substitutes shift to Mon/Tue |
+
+Each row becomes a test case comparing the function's own answer against a value worked out independently by hand:
+
+```sql
+WITH test_cases AS (
+    SELECT 'Weekend + Summer BH (2026)' AS test_description,
+           DATE '2026-08-28' AS transaction_date,
+           DATE '2026-09-02' AS actual_clearance_date  -- deliberately wrong (correct: 03-Sep-2026)
+    FROM dual UNION ALL
+    SELECT 'Xmas Day/Boxing sub (2026)',
+           DATE '2026-12-23', DATE '2026-12-30'
+    FROM dual
+    -- ... the remaining scenarios from the table above
+)
+SELECT
+    test_description                                                  AS "TestDescription",
+    TO_CHAR(transaction_date, 'DD-MON-YYYY (DY)')                     AS "TransactionDate",
+    TO_CHAR(get_clearance_date(transaction_date), 'DD-MON-YYYY (DY)') AS "ExpectedClearance",
+    TO_CHAR(actual_clearance_date, 'DD-MON-YYYY (DY)')                AS "ActualClearance",
+    CASE WHEN get_clearance_date(transaction_date) = actual_clearance_date
+         THEN 'Pass' ELSE 'Fail' END                                  AS "Status"
+FROM test_cases
+ORDER BY transaction_date;
+```
+
+The column names deliberately borrow business language rather than dev-test jargon: **ExpectedClearance** is what the system itself calculates - the date a customer or back-office user would actually be told. **ActualClearance** is the ground truth, worked out independently by hand from the calendar. Framed that way, the report reads naturally to a business analyst or auditor, not just to a tester.
+
+## Proving the Test Actually Tests Something
+
+Three of the ten scenarios above were seeded with a deliberately wrong `ActualClearance` - one day off the correct hand-worked value. A test suite where every row shows "Pass" proves nothing on its own; it's just as likely the comparison is broken as that the logic is right. Running the script confirms the harness catches exactly the rows it should and nothing else:
+
+```
+TestDescription              TransactionDate                     ExpectedClearance                   ActualClearance                     Stat
+---------------------------- ----------------------------------- ----------------------------------- ----------------------------------- ----
+Weekend + Summer BH (2026)   28-AUG-2026 (FRI)                   03-SEP-2026 (THU)                   02-SEP-2026 (WED)                   Fail
+Baseline - plain weekday     01-SEP-2026 (TUE)                   04-SEP-2026 (FRI)                   04-SEP-2026 (FRI)                   Pass
+Single weekend crossing      03-SEP-2026 (THU)                   08-SEP-2026 (TUE)                   08-SEP-2026 (TUE)                   Pass
+Xmas Day/Boxing sub (2026)   23-DEC-2026 (WED)                   30-DEC-2026 (WED)                   30-DEC-2026 (WED)                   Pass
+New Year's Day (2027) + w/e  29-DEC-2026 (TUE)                   04-JAN-2027 (MON)                   04-JAN-2027 (MON)                   Pass
+Good Fri/Easter Mon (2027)   24-MAR-2027 (WED)                   31-MAR-2027 (WED)                   30-MAR-2027 (TUE)                   Fail
+Early May BH (2027)          30-APR-2027 (FRI)                   06-MAY-2027 (THU)                   06-MAY-2027 (THU)                   Pass
+Spring BH (2027)             28-MAY-2027 (FRI)                   03-JUN-2027 (THU)                   03-JUN-2027 (THU)                   Pass
+Summer BH (2027)             27-AUG-2027 (FRI)                   02-SEP-2027 (THU)                   02-SEP-2027 (THU)                   Pass
+Xmas/Boxing subs, w/e (2027) 23-DEC-2027 (THU)                   30-DEC-2027 (THU)                   29-DEC-2027 (WED)                   Fail
+
+10 rows selected.
+```
+
+Exactly the three seeded rows come back `Fail`, and every genuine boundary case - the Easter closure, the two Christmas/Boxing Day clusters, the New Year's crossing - comes back `Pass`. That's the confirmation that both the calendar table and the function are correct, not just that the test happens to agree with itself.
+
+## Key Takeaways
+
+1. **Put calendar knowledge in exactly one place.** Every date-driven rule - clearance dates, payment due dates, arrears grace periods, cooling-off periods - can query the same `calendar_days` table instead of each reimplementing its own weekend/holiday logic. Adding next year's bank holidays is a handful of `INSERT` statements, not a code change.
+2. **Seed known-wrong values on purpose.** A test report that's all green proves the comparison logic works only if you've also seen it produce red. Planting a few deliberate mismatches turns "it passed" into "it passed, and I know it's capable of failing."
+3. **Test the boundaries, not the middle of the week.** An ordinary Tuesday with no weekend or holiday nearby will pass regardless of whether the underlying logic is right. The defects live at the edges - the Friday before a Monday holiday, the day before a four-day Easter closure, the week Christmas Day and Boxing Day both fall on a weekend.
+4. **Report in the business's own vocabulary.** Naming the function's output "ExpectedClearance" and the hand-worked value "ActualClearance" mirrors how the business already talks about clearance dates, so the same report can go straight to an analyst or auditor without translation.
+5. **A calendar table is auditable in a way that inline date logic isn't.** Anyone with SQL access can query `calendar_days` and check a specific date, without needing to read or trust PL/SQL.
+
+---
+
+_Working with date-driven business rules or looking to build test data that actually proves your logic works? [Get in touch](/contact) - I'm happy to talk through the approach._
