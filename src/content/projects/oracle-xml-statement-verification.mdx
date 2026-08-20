@@ -16,8 +16,8 @@ order: 5
 results:
   - metric: "Statements Modelled"
     value: "3 monthly XML statements across 2 customers"
-  - metric: "Hand-Rolled Functions Replaced"
-    value: "2 (tag + Nth-occurrence lookups) with 1 XMLTABLE call"
+  - metric: "Hand-Rolled Function Replaced"
+    value: "1 (tag + occurrence lookup) with 1 XMLTABLE call"
   - metric: "Deliberate Differences Seeded"
     value: "5, across inserts, updates and deletes, to prove the diff catches them"
 ---
@@ -28,19 +28,19 @@ At the time, I solved the "get the value out of the XML" half of that problem wi
 
 ## The Old Way: Finding Tags by Counting Characters
 
-The functions below aren't the original Solifi code - that belonged to my employer at the time and I don't have it - but they're a faithful reconstruction of the mechanics: `INSTR` to find an opening tag, another `INSTR` to find its matching close, `SUBSTR` to pull out whatever sat between them.
+The function below isn't the original Solifi code - that belonged to my employer at the time and I don't have it - but it's a faithful reconstruction of the mechanics: `INSTR` to find an opening tag, another `INSTR` to find its matching close, `SUBSTR` to pull out whatever sat between them. `INSTR` takes an optional fourth argument for *which* occurrence to find, so one function handles both "the only `CustomerId`" and "the third `Transaction`" - no second function, no loop.
 
 ```sql
--- Returns the value of the FIRST occurrence of a tag
 CREATE OR REPLACE FUNCTION get_xml_tag_value (
-    p_xml IN VARCHAR2,
-    p_tag IN VARCHAR2
+    p_xml        IN VARCHAR2,
+    p_tag        IN VARCHAR2,
+    p_occurrence IN PLS_INTEGER DEFAULT 1
 ) RETURN VARCHAR2
 IS
     v_start_pos PLS_INTEGER;
     v_end_pos   PLS_INTEGER;
 BEGIN
-    v_start_pos := INSTR(p_xml, '<' || p_tag || '>');
+    v_start_pos := INSTR(p_xml, '<' || p_tag || '>', 1, p_occurrence);
     IF v_start_pos = 0 THEN
         RETURN NULL;
     END IF;
@@ -50,30 +50,9 @@ BEGIN
     RETURN SUBSTR(p_xml, v_start_pos, v_end_pos - v_start_pos);
 END get_xml_tag_value;
 /
-
--- Returns the value of the Nth occurrence of a repeating tag
-CREATE OR REPLACE FUNCTION get_nth_xml_tag_value (
-    p_xml        IN VARCHAR2,
-    p_tag        IN VARCHAR2,
-    p_occurrence IN PLS_INTEGER
-) RETURN VARCHAR2
-IS
-    v_pos PLS_INTEGER := 1;
-BEGIN
-    FOR i IN 1 .. p_occurrence LOOP
-        v_pos := INSTR(p_xml, '<' || p_tag || '>', v_pos);
-        IF v_pos = 0 THEN
-            RETURN NULL;
-        END IF;
-        v_pos := v_pos + 1;   -- step past this match before hunting for the next
-    END LOOP;
-
-    RETURN get_xml_tag_value(SUBSTR(p_xml, v_pos - 1), p_tag);
-END get_nth_xml_tag_value;
-/
 ```
 
-To get the amount of the third transaction on a statement, you'd call `get_nth_xml_tag_value(xml_data, 'Transaction', 3)` to land on the right block, then run `get_xml_tag_value` against that substring for `Amount`, `Description`, and whatever else you needed. To loop through *every* transaction, you first needed to know how many there were - another pass counting occurrences of `<Transaction>` before you could even start. And because the whole approach is purely positional, it's fragile in ways that have nothing to do with the data being wrong: reorder two elements, add a namespace, or introduce a same-named tag anywhere else in the document, and the offsets shift under you. None of that is a data problem - it's a parser problem, and you're maintaining the parser.
+To get the amount off the third transaction on a statement, you'd still scope down first - `get_xml_tag_value(xml_data, 'Transaction', 3)` to land on just that block's inner XML - then call the same function again against that substring for `Amount`, `Description`, and whatever else you needed. What's gone is the loop that used to find "the third one": `INSTR`'s fourth argument already means "which occurrence," so landing on the right `Transaction` block is one call, not a hand-written walk through the first two. To loop through *every* transaction, you still needed to know how many there were first - another pass counting occurrences of `<Transaction>` before you could even start. And because the whole approach is purely positional, it's fragile in ways that have nothing to do with the data being wrong: reorder two elements, add a namespace, or introduce a same-named tag anywhere else in the document, and the offsets shift under you. None of that is a data problem - it's a parser problem, and you're maintaining the parser.
 
 ## The XML Way: XMLTYPE and XMLTABLE
 
@@ -143,7 +122,7 @@ And a sample statement stored in it looks like this (trimmed to two transactions
 </Statement>
 ```
 
-`XMLTABLE` replaces both hand-rolled functions in one declarative block. Point it at `/Statement/Transactions/Transaction` as the row path and it returns one row per transaction automatically - no counting occurrences, no looping, no "Nth" parameter at all:
+`XMLTABLE` replaces the hand-rolled function in one declarative block. Point it at `/Statement/Transactions/Transaction` as the row path and it returns one row per transaction automatically - no counting occurrences, no looping, no "Nth" parameter at all:
 
 ```sql
 SELECT s.id                                AS statement_id,
@@ -175,7 +154,7 @@ WHERE  c.customer_id = '&p_customer_id'
 ORDER  BY s.id, t.transaction_id;
 ```
 
-Nested elements are just deeper `PATH` expressions (`Customer/Name/FirstName`), and repeating elements are just a different row path. The `XMLTABLE` doing the header lookup (`c`) and the one exploding the transactions (`t`) are joined implicitly by both being driven off the same `s.xml_data` document - that replaces the entire "locate the block, then extract fields from it" two-step the hand-rolled functions needed.
+Nested elements are just deeper `PATH` expressions (`Customer/Name/FirstName`), and repeating elements are just a different row path. The `XMLTABLE` doing the header lookup (`c`) and the one exploding the transactions (`t`) are joined implicitly by both being driven off the same `s.xml_data` document - that replaces the entire "locate the block, then extract fields from it" two-step the hand-rolled function needed.
 
 ## But a Statement in Isolation Proves Nothing
 
