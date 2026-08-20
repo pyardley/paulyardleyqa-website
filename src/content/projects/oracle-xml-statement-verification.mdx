@@ -1,0 +1,364 @@
+---
+title: "The Statement Was XML. The Source of Truth Was Two Relational Tables. How Do You Prove They Match?"
+description: "Verifying a machine-generated XML statement against the customer and transaction data it was built from used to mean PL/SQL functions that located tags by counting characters. Here's how Oracle's XMLTABLE and an EXCEPT/MINUS diff technique solve the same problem in a fraction of the code."
+industry: "Car Finance"
+role: "Test Analyst"
+duration: "Project-based"
+tools: ["Oracle SQL", "PL/SQL", "XML", "SQL*Plus"]
+scope:
+  [
+    "Data Verification",
+    "XML Processing",
+    "Test Automation",
+    "Database Testing",
+  ]
+order: 5
+results:
+  - metric: "Statements Modelled"
+    value: "3 monthly XML statements across 2 customers"
+  - metric: "Hand-Rolled Functions Replaced"
+    value: "2 (tag + Nth-occurrence lookups) with 1 XMLTABLE call"
+  - metric: "Deliberate Differences Seeded"
+    value: "5, across inserts, updates and deletes, to prove the diff catches them"
+---
+
+A loan management platform I tested at Solifi generated monthly account statements as XML - one document per customer, per period, holding everything from their name and address down to every individual transaction. The XML itself was easy enough to eyeball. The actual test question was harder: does every value in that document genuinely match the customer and transaction rows it was supposed to be built from? A statement that's internally well-formed but quietly wrong - a stale address, a transaction that never happened, a balance that doesn't reconcile - is worse than one that fails to parse at all, because nothing flags it.
+
+At the time, I solved the "get the value out of the XML" half of that problem with a hand-rolled PL/SQL function: give it a tag name like `CustomerId`, and it would find the opening and closing tags by character position and return whatever sat between them. A second function did the same thing for the Nth occurrence of a tag, which was the only way to reach into a repeating element like `Transaction` - a statement might have anywhere from a handful to dozens of them. It worked, but it was slow to extend and easy to break. I'd solve it completely differently today. This post rebuilds the problem end to end with fictional bank statement data - not the real Solifi statements, which I no longer have access to - but the shape of the problem, and the technique I'd reach for now, are exactly what I'd bring to it today.
+
+## The Old Way: Finding Tags by Counting Characters
+
+The functions below aren't the original Solifi code - that belonged to my employer at the time and I don't have it - but they're a faithful reconstruction of the mechanics: `INSTR` to find an opening tag, another `INSTR` to find its matching close, `SUBSTR` to pull out whatever sat between them.
+
+```sql
+-- Returns the value of the FIRST occurrence of a tag
+CREATE OR REPLACE FUNCTION get_xml_tag_value (
+    p_xml IN VARCHAR2,
+    p_tag IN VARCHAR2
+) RETURN VARCHAR2
+IS
+    v_start_pos PLS_INTEGER;
+    v_end_pos   PLS_INTEGER;
+BEGIN
+    v_start_pos := INSTR(p_xml, '<' || p_tag || '>');
+    IF v_start_pos = 0 THEN
+        RETURN NULL;
+    END IF;
+    v_start_pos := v_start_pos + LENGTH(p_tag) + 2;   -- skip past '<Tag>'
+    v_end_pos   := INSTR(p_xml, '</' || p_tag || '>', v_start_pos);
+
+    RETURN SUBSTR(p_xml, v_start_pos, v_end_pos - v_start_pos);
+END get_xml_tag_value;
+/
+
+-- Returns the value of the Nth occurrence of a repeating tag
+CREATE OR REPLACE FUNCTION get_nth_xml_tag_value (
+    p_xml        IN VARCHAR2,
+    p_tag        IN VARCHAR2,
+    p_occurrence IN PLS_INTEGER
+) RETURN VARCHAR2
+IS
+    v_pos PLS_INTEGER := 1;
+BEGIN
+    FOR i IN 1 .. p_occurrence LOOP
+        v_pos := INSTR(p_xml, '<' || p_tag || '>', v_pos);
+        IF v_pos = 0 THEN
+            RETURN NULL;
+        END IF;
+        v_pos := v_pos + 1;   -- step past this match before hunting for the next
+    END LOOP;
+
+    RETURN get_xml_tag_value(SUBSTR(p_xml, v_pos - 1), p_tag);
+END get_nth_xml_tag_value;
+/
+```
+
+To get the amount of the third transaction on a statement, you'd call `get_nth_xml_tag_value(xml_data, 'Transaction', 3)` to land on the right block, then run `get_xml_tag_value` against that substring for `Amount`, `Description`, and whatever else you needed. To loop through *every* transaction, you first needed to know how many there were - another pass counting occurrences of `<Transaction>` before you could even start. And because the whole approach is purely positional, it's fragile in ways that have nothing to do with the data being wrong: reorder two elements, add a namespace, or introduce a same-named tag anywhere else in the document, and the offsets shift under you. None of that is a data problem - it's a parser problem, and you're maintaining the parser.
+
+## The XML Way: XMLTYPE and XMLTABLE
+
+Oracle has had native XML support since well before I was solving it by counting characters. The table holding the statements looks like this:
+
+```sql
+CREATE TABLE xml_statements (
+    id             NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    date_produced  DATE            NOT NULL,
+    xml_data       VARCHAR2(4000)  NOT NULL
+);
+```
+
+And a sample statement stored in it looks like this (trimmed to two transactions - a real row holds as many as the period produced):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Statement>
+    <StatementHeader>
+        <StatementId>STMT-2026-0001</StatementId>
+        <StatementPeriod>
+            <StartDate>2026-06-01</StartDate>
+            <EndDate>2026-06-30</EndDate>
+        </StatementPeriod>
+        <GeneratedDate>2026-07-01</GeneratedDate>
+    </StatementHeader>
+    <Customer>
+        <CustomerId>CUST100234</CustomerId>
+        <Name>
+            <FirstName>Sarah</FirstName>
+            <LastName>Thompson</LastName>
+        </Name>
+        <Address>
+            <Line1>42 Wattle Street</Line1>
+            <City>Melbourne</City>
+            <State>VIC</State>
+            <PostalCode>3000</PostalCode>
+            <Country>Australia</Country>
+        </Address>
+        <Email>sarah.thompson@example.com</Email>
+    </Customer>
+    <Account>
+        <AccountNumber>1234567890</AccountNumber>
+        <AccountType>Everyday Checking</AccountType>
+        <Currency>AUD</Currency>
+        <OpeningBalance>2450.75</OpeningBalance>
+        <ClosingBalance>3180.20</ClosingBalance>
+    </Account>
+    <Transactions>
+        <Transaction>
+            <TransactionId>TXN000101</TransactionId>
+            <Date>2026-06-02</Date>
+            <Description>Salary Payment - Acme Corp Pty Ltd</Description>
+            <Type>Credit</Type>
+            <Amount>3200.00</Amount>
+            <Balance>5650.75</Balance>
+        </Transaction>
+        <Transaction>
+            <TransactionId>TXN000102</TransactionId>
+            <Date>2026-06-04</Date>
+            <Description>Woolworths Supermarket</Description>
+            <Type>Debit</Type>
+            <Amount>145.32</Amount>
+            <Balance>5505.43</Balance>
+        </Transaction>
+    </Transactions>
+</Statement>
+```
+
+`XMLTABLE` replaces both hand-rolled functions in one declarative block. Point it at `/Statement/Transactions/Transaction` as the row path and it returns one row per transaction automatically - no counting occurrences, no looping, no "Nth" parameter at all:
+
+```sql
+SELECT s.id                                AS statement_id,
+       s.date_produced,
+       c.customer_id,
+       t.transaction_id,
+       TO_DATE(t.txn_date, 'YYYY-MM-DD')   AS txn_date,
+       t.description,
+       t.txn_type,
+       t.amount,
+       t.balance
+FROM   xml_statements s,
+       XMLTABLE('/Statement'
+                PASSING XMLTYPE(s.xml_data)
+                COLUMNS
+                    customer_id VARCHAR2(20) PATH 'Customer/CustomerId'
+               ) c,
+       XMLTABLE('/Statement/Transactions/Transaction'
+                PASSING XMLTYPE(s.xml_data)
+                COLUMNS
+                    transaction_id VARCHAR2(20)  PATH 'TransactionId',
+                    txn_date       VARCHAR2(10)  PATH 'Date',
+                    description    VARCHAR2(200) PATH 'Description',
+                    txn_type       VARCHAR2(10)  PATH 'Type',
+                    amount         NUMBER        PATH 'Amount',
+                    balance        NUMBER        PATH 'Balance'
+               ) t
+WHERE  c.customer_id = '&p_customer_id'
+ORDER  BY s.id, t.transaction_id;
+```
+
+Nested elements are just deeper `PATH` expressions (`Customer/Name/FirstName`), and repeating elements are just a different row path. The `XMLTABLE` doing the header lookup (`c`) and the one exploding the transactions (`t`) are joined implicitly by both being driven off the same `s.xml_data` document - that replaces the entire "locate the block, then extract fields from it" two-step the hand-rolled functions needed.
+
+## But a Statement in Isolation Proves Nothing
+
+Being able to shred the XML cleanly only solves half the problem. A statement can be perfectly well-formed and still be wrong, if it doesn't match the data it claims to summarise. Proving that means comparing it against a source of truth - so the same sample data also exists as ordinary relational tables:
+
+```sql
+CREATE TABLE customer (
+    customer_id     VARCHAR2(20)   NOT NULL PRIMARY KEY,
+    first_name      VARCHAR2(50)   NOT NULL,
+    last_name       VARCHAR2(50)   NOT NULL,
+    address_line1   VARCHAR2(100),
+    city            VARCHAR2(50),
+    state           VARCHAR2(10),
+    postal_code     VARCHAR2(10),
+    country         VARCHAR2(50),
+    email           VARCHAR2(100),
+    account_number  VARCHAR2(20),
+    account_type    VARCHAR2(50),
+    currency        VARCHAR2(3)
+);
+
+CREATE TABLE transaction (
+    transaction_id  VARCHAR2(20)   NOT NULL PRIMARY KEY,
+    customer_id     VARCHAR2(20)   NOT NULL REFERENCES customer(customer_id),
+    statement_id    VARCHAR2(20)   NOT NULL,
+    txn_date        DATE           NOT NULL,
+    description     VARCHAR2(200)  NOT NULL,
+    txn_type        VARCHAR2(10)   NOT NULL,
+    amount          NUMBER(12,2)   NOT NULL,
+    balance         NUMBER(12,2)   NOT NULL
+);
+```
+
+Now there are two independent representations of the same facts - one embedded in XML, one relational - and the test is simply: do they agree?
+
+## Comparing XML Against the Source with EXCEPT/MINUS
+
+I've already written about the CTE-based `EXCEPT` pattern for diffing two same-shaped tables in [Using SQL EXCEPT to Detect Inserts, Updates and Deletes Between Two Tables](/blog/sql-except-table-differences) - build an `InsUpd` set and a `DelUpd` set from each side, then classify rows that key-match across both as value mismatches and rows that only appear on one side as pure inserts or deletes. The neat part is that it doesn't care where either side's rows actually come from. One side just needs to be shredded out of the XML first:
+
+```sql
+WITH customer_statement_ids AS (
+    SELECT h.customer_id, h.statement_id
+    FROM   xml_statements s,
+           XMLTABLE('/Statement'
+                    PASSING XMLTYPE(s.xml_data)
+                    COLUMNS
+                        customer_id  VARCHAR2(20) PATH 'Customer/CustomerId',
+                        statement_id VARCHAR2(20) PATH 'StatementHeader/StatementId'
+                   ) h
+),
+xml_customer AS (
+    SELECT
+        h.statement_id,
+        x.customer_id, x.first_name, x.last_name, x.address_line1, x.city,
+        x.state, x.postal_code, x.country, x.email, x.account_number,
+        x.account_type, x.currency
+    FROM   xml_statements s,
+           XMLTABLE('/Statement'
+                    PASSING XMLTYPE(s.xml_data)
+                    COLUMNS statement_id VARCHAR2(20) PATH 'StatementHeader/StatementId'
+                   ) h,
+           XMLTABLE('/Statement'
+                    PASSING XMLTYPE(s.xml_data)
+                    COLUMNS
+                        customer_id    VARCHAR2(20)  PATH 'Customer/CustomerId',
+                        first_name     VARCHAR2(50)  PATH 'Customer/Name/FirstName',
+                        last_name      VARCHAR2(50)  PATH 'Customer/Name/LastName',
+                        address_line1  VARCHAR2(100) PATH 'Customer/Address/Line1',
+                        city           VARCHAR2(50)  PATH 'Customer/Address/City',
+                        state          VARCHAR2(10)  PATH 'Customer/Address/State',
+                        postal_code    VARCHAR2(10)  PATH 'Customer/Address/PostalCode',
+                        country        VARCHAR2(50)  PATH 'Customer/Address/Country',
+                        email          VARCHAR2(100) PATH 'Customer/Email',
+                        account_number VARCHAR2(20)  PATH 'Account/AccountNumber',
+                        account_type   VARCHAR2(50)  PATH 'Account/AccountType',
+                        currency       VARCHAR2(3)   PATH 'Account/Currency'
+                   ) x
+),
+customer_expanded AS (
+    SELECT
+        NVL(csi.statement_id, '(no statement)') AS statement_id,
+        c.customer_id, c.first_name, c.last_name, c.address_line1, c.city,
+        c.state, c.postal_code, c.country, c.email, c.account_number,
+        c.account_type, c.currency
+    FROM   customer c
+    LEFT   JOIN customer_statement_ids csi ON csi.customer_id = c.customer_id
+),
+ins_upd AS ( -- (customer, statement) pairs as described in the XML with no exact match in CUSTOMER
+    SELECT * FROM xml_customer
+    MINUS
+    SELECT * FROM customer_expanded
+),
+del_upd AS ( -- (customer, statement) pairs in CUSTOMER with no exact match in the XML
+    SELECT * FROM customer_expanded
+    MINUS
+    SELECT * FROM xml_customer
+)
+SELECT 'VALUE MISMATCH - CUSTOMER TABLE' AS diff_type, d.*
+FROM   del_upd d JOIN ins_upd i ON i.customer_id = d.customer_id AND i.statement_id = d.statement_id
+UNION ALL
+SELECT 'VALUE MISMATCH - XML STATEMENT' AS diff_type, i.*
+FROM   ins_upd i JOIN del_upd d ON d.customer_id = i.customer_id AND d.statement_id = i.statement_id
+UNION ALL
+SELECT 'IN CUSTOMER TABLE ONLY (missing from XML)' AS diff_type, d.*
+FROM   del_upd d LEFT JOIN ins_upd i ON i.customer_id = d.customer_id AND i.statement_id = d.statement_id
+WHERE  i.customer_id IS NULL
+UNION ALL
+SELECT 'IN XML ONLY (missing from CUSTOMER table)' AS diff_type, i.*
+FROM   ins_upd i LEFT JOIN del_upd d ON d.customer_id = i.customer_id AND d.statement_id = i.statement_id
+WHERE  d.customer_id IS NULL
+ORDER  BY 2, 3, 1;
+```
+
+There's a small dialect wrinkle: Oracle didn't support `EXCEPT` as a keyword until 21c, so this uses `MINUS`, which is identical in behaviour. The grain is the interesting part. Sarah Thompson has two statements in the sample data (June and July), so `xml_customer` naturally produces two rows for her, one per statement, each tagged with `statement_id`. `CUSTOMER` only knows about her *current* profile, as a single row - so `customer_expanded` replicates that one row once for every statement she has, via `customer_statement_ids`. A customer with zero statements at all (nothing in the XML to join against) still gets exactly one row, tagged `'(no statement)'` by the `LEFT JOIN` and `NVL`, rather than silently vanishing from the report. No `DISTINCT` is needed anywhere - both sides are already unique at the `(customer_id, statement_id)` grain - and the payoff is real: if only one of a customer's several statements has stale data, that's the one statement that gets flagged, not the customer as an undifferentiated whole. The transaction comparison in the same script follows a simpler shape, just with a second `XMLTABLE` exploding `Transactions/Transaction` into one row each, tagged with its parent statement's `CustomerId` and `StatementId` - transaction IDs are already globally unique, so there's no equivalent expansion needed on that side.
+
+## Proving the Diff Actually Catches Something
+
+A verification query that's never seen a real difference hasn't proven anything - it might just as easily be broken as correct. So the full script deliberately perturbs `customer` and `transaction` first, runs the diff, then rolls everything back:
+
+```sql
+-- 1a. CUSTOMER value mismatch: table says one thing, XML says another.
+UPDATE customer
+SET    email = 'sarah.t.updated@example.com'
+WHERE  customer_id = 'CUST100234';
+
+-- 1b. CUSTOMER row with no matching statement in the XML at all.
+INSERT INTO customer (customer_id, first_name, last_name, address_line1, city, state, postal_code, country, email, account_number, account_type, currency)
+VALUES ('CUST100999', 'Emma', 'Walker', '7 Ocean Parade', 'Brisbane', 'QLD', '4000', 'Australia', 'emma.walker@example.com', '5544332211', 'Everyday Checking', 'AUD');
+
+-- 1c. Remove a customer (and, to satisfy the foreign key, their
+--     transactions) that the XML still describes. This produces an
+--     "IN XML ONLY" row for the customer AND for all seven of their
+--     transactions in one go.
+DELETE FROM transaction WHERE customer_id = 'CUST100587';
+DELETE FROM customer    WHERE customer_id = 'CUST100587';
+
+-- 1d. TRANSACTION value mismatch: amount corrected in the table after the
+--     statement was already produced.
+UPDATE transaction
+SET    amount = 24.99
+WHERE  transaction_id = 'TXN000305';
+
+-- 1e. TRANSACTION row with no matching entry in the XML at all.
+INSERT INTO transaction (transaction_id, customer_id, statement_id, txn_date, description, txn_type, amount, balance)
+VALUES ('TXN000999', 'CUST100234', 'STMT-2026-0003', DATE '2026-07-30', 'Late Fee Adjustment', 'Debit', 15.00, 2952.85);
+```
+
+Five changes, deliberately spanning all three categories the diff can report. Rather than work the expected output out by hand, I ran the whole thing - all three scripts, in order - against a live Oracle Database 26ai Free instance on a machine on my network, connecting with Python's `oracledb` driver in thin mode (no Oracle Instant Client install needed). Because the email change (1a) is a change to Sarah's *profile*, not to any one statement, it's now checked against both of her statements independently rather than reported once for "the customer" - the query comes back with six rows:
+
+| diff_type | statement_id | customer_id | what changed |
+| --- | --- | --- | --- |
+| IN CUSTOMER TABLE ONLY (missing from XML) | (no statement) | CUST100999 | Emma Walker exists in the table, no statement was ever generated for her |
+| VALUE MISMATCH - CUSTOMER TABLE | STMT-2026-0001 | CUST100234 | table's email is `sarah.t.updated@example.com` |
+| VALUE MISMATCH - XML STATEMENT | STMT-2026-0001 | CUST100234 | XML's email is still `sarah.thompson@example.com` |
+| IN XML ONLY (missing from CUSTOMER table) | STMT-2026-0002 | CUST100587 | Michael Nguyen deleted from the table, still described in his June statement |
+| VALUE MISMATCH - CUSTOMER TABLE | STMT-2026-0003 | CUST100234 | table's email is `sarah.t.updated@example.com` |
+| VALUE MISMATCH - XML STATEMENT | STMT-2026-0003 | CUST100234 | XML's email is still `sarah.thompson@example.com` |
+
+To confirm the per-statement grain was actually earning its keep rather than just adding a column, I tried a second seed on the real instance: edit *only* `STMT-2026-0001`'s stored XML so its city reads `Geelong` instead of `Melbourne`, leaving `STMT-2026-0003` untouched. The result was exactly one mismatch pair, tagged `STMT-2026-0001` - July came back clean. A customer with a long statement history doesn't get treated as one undifferentiated "does this match somewhere" verdict; each statement stands on its own.
+
+The transaction query comes back with ten - the paired mismatch on `TXN000305`, the new `TXN000999` with no matching XML entry, and all seven of Michael Nguyen's transactions reported as `IN XML ONLY`, a direct consequence of deleting their parent customer. That cascade is worth pausing on: one deliberate customer deletion produced eight flagged rows across two different result sets, which is a reasonably honest preview of what a real "customer record removed without updating downstream statements" defect would actually look like in this kind of report.
+
+The script closes with `ROLLBACK` so none of this survives past the test run:
+
+```sql
+ROLLBACK;
+
+SELECT (SELECT COUNT(*) FROM customer)    AS customer_count,
+       (SELECT COUNT(*) FROM transaction) AS transaction_count
+FROM   dual;
+```
+
+On the real instance, that final check comes back `2, 24` - exactly where `create_and_populate_customer_transaction.sql` left things, confirming the rollback genuinely undid all five changes rather than just the query results happening to look right. That only works because the session wasn't autocommitting: `oracledb`, like SQL*Plus, defaults to manual commit, so nothing in section 1 was actually durable until a `COMMIT` said so - and none ever ran. A client that commits every statement individually would leave the seeded differences in place regardless of the `ROLLBACK`, which is worth checking before trusting any script built around this pattern.
+
+## Key Takeaways
+
+1. **Don't hand-roll a parser for a format the platform already understands.** `INSTR`/`SUBSTR` tag-hunting works, but every field needs its own extraction logic and every structural change risks shifting an offset. `XMLTABLE` turns the same job into a declarative `PATH` list.
+2. **Repeating elements are where hand-rolled parsers hurt most.** "Give me the Nth occurrence" needing its own function and its own counting pass disappears entirely once a row-generating function like `XMLTABLE` is pointed at the repeating element's path - each occurrence just becomes another row.
+3. **A generated document isn't verified until it's checked against its source.** Internal well-formedness and correctness are different properties; a statement can satisfy the first and fail the second silently.
+4. **Match the comparison grain to what you actually need to prove.** Collapsing several statements down to one row per customer - via `DISTINCT` or any other means - only ever answers "does this customer match somewhere." Expanding the source side out to the same grain as the generated side (one row per statement, not per customer) costs one extra join and answers the more useful question: *which* statement is wrong.
+5. **Reuse a general diff pattern rather than writing bespoke comparisons per table.** The same `EXCEPT`/`MINUS` classification technique that compares two ordinary tables works unchanged when one side is shredded out of XML first - the CTE doesn't know or care where its rows came from.
+6. **Prove a verification query can actually detect something before trusting it.** Seeding known differences and confirming the diff reports exactly those - no more, no less - is the difference between "it passed" and "it passed, and I've seen it fail."
+
+---
+
+_Migrating away from a home-grown parser, or need to prove a generated document actually matches its source data? [Get in touch](/contact) - I'm happy to talk through the approach._
