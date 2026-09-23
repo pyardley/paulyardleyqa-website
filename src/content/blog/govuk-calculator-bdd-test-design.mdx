@@ -1,0 +1,362 @@
+---
+title: "BDD Test Design for a GOV.UK Calculator: Shared State, Stable Labels, and Live Links"
+description: "Four test-design techniques from a Playwright BDD suite covering GOV.UK's holiday entitlement calculator: a fixture that carries recorded answers into a final independently-computed assertion, a stable-label map that decouples feature files from live page wording, a Gherkin-native HTML report, and steps that check outbound links are both live and relevant."
+pubDate: 2026-09-16
+author: "Paul Yardley"
+tags:
+  [
+    "Playwright",
+    "BDD",
+    "playwright-bdd",
+    "Gherkin",
+    "TypeScript",
+    "Test Automation",
+    "Page Object Model",
+  ]
+readingTime: "12 min read"
+draft: false
+---
+
+GOV.UK's [holiday entitlement calculator](https://www.gov.uk/calculate-your-holiday-entitlement) is a multi-page wizard: one question per page, state carried entirely in the URL, six different calculation methods depending on how someone works (days per week, hours per week, shifts, compressed hours, annualised hours, irregular hours), each with its own pro-rating rules for starting or leaving part way through a leave year. Testing it well with Gherkin surfaces a genuine design problem that a simpler CRUD form doesn't: a `Scenario` walks through five or six pages, entering a different answer on each one, and the final `Then` step needs to know *every one of those answers* to independently compute the expected result - but each `Given`/`When` step in playwright-bdd only ever sees the fixtures it declares, not what earlier steps in the same scenario did.
+
+This post covers four things from that suite worth stealing for other BDD projects: a fixture that threads recorded answers through to the final assertion, a stable-label map that keeps feature files readable and decoupled from a live site's actual wording, a Gherkin-native HTML report generated alongside the standard Playwright one, and a pair of steps that check outbound links are both reachable and relevant, not just present.
+
+## The Problem: A Step Doesn't Know What Earlier Steps Did
+
+A typical scenario in this suite looks like this - four separate `When`/`Given` steps, each entering one answer, then a single `Then` step asserting the final outcome:
+
+```gherkin
+Scenario Outline: Days worked per week entitlement is pro-rated against the 28-day statutory cap
+  Given the user selects "for a full leave year" and continues
+  When the user enters "<days>" for "Number of days worked per week?" and continues
+  Then the page heading is "Calculate holiday entitlement: Information based on your answers"
+  And the outcome matches the computed entitlement using the days worked per week method
+
+  Examples:
+    | days |
+    | 5    |
+    | 3    |
+```
+
+The last line is the interesting one. It doesn't assert a hardcoded string - it calls a ported, independent implementation of GOV.UK's own calculation and asserts the page matches *that*. For the more involved scenarios (starting or leaving part way through a leave year), the calculation needs a start date, a leaving date, and a leave year start date - each entered by a separate `When` step earlier in the scenario, on separate pages.
+
+The step that finally asserts the outcome doesn't have those values in scope. It only has whatever fixtures it declares in its own function signature. The fix is a fixture that acts as shared, per-scenario scratch space.
+
+## The Fix: A `recordedAnswers` Fixture
+
+`support/scenarioInputs.ts` defines a plain, entirely-optional-fields interface - every field a scenario *could* enter, across every one of the six calculation methods:
+
+```typescript
+// A plain record of whatever dates and numbers a scenario has entered so
+// far, built up as Given/When steps run. Each "Then ... using the <method>
+// method" step in calculator-assertions.steps.ts reads the fields it
+// needs from this and passes them straight to the matching function in
+// calculators/ - there's no logic here that works out which method
+// applies, since the feature file already says so explicitly.
+export interface RecordedAnswers {
+  startDate?: Date;
+  leavingDate?: Date;
+  leaveYearStartDate?: Date;
+  workingDaysPerWeek?: number;
+  hoursPerWeek?: number;
+  hoursPerShift?: number;
+  shiftsPerShiftPattern?: number;
+  daysPerShiftPattern?: number;
+  hoursInPayPeriod?: number;
+}
+
+// Fresh, empty answers for one scenario. Registered as a Playwright fixture
+// in fixtures/fixtures.ts, so every test gets its own via this function -
+// nothing here needs to reset state between scenarios.
+export function createRecordedAnswers(): RecordedAnswers {
+  return {};
+}
+```
+
+It's registered as an ordinary Playwright fixture, exactly like a page object:
+
+```typescript
+// fixtures/fixtures.ts
+export const test = base.extend<Fixtures>({
+  calculatorFlowPage: async ({ page }, use) => use(new CalculatorFlowPage(page)),
+  recordedAnswers: async ({}, use) => use(createRecordedAnswers()),
+});
+```
+
+Because Playwright creates a fresh fixture instance per test, every scenario (and every `Scenario Outline` example row, since playwright-bdd compiles each row to its own test) gets its own empty `recordedAnswers` object with zero setup. There's no manual reset between scenarios to forget.
+
+The two generic `When` steps that enter dates and numbers - one step definition each, reused across every question in the wizard - write into it before performing the actual UI action:
+
+```typescript
+// steps/calculator-flow.steps.ts
+When(
+  'the user enters {string} for {string} and continues',
+  async ({ calculatorFlowPage, recordedAnswers }, value: string, question: string) => {
+    recordNumericAnswer(recordedAnswers, question, value);
+    await calculatorFlowPage.fillTextboxAndContinue(question, value);
+  },
+);
+
+When(
+  'the user enters the date {string} for {string} and continues',
+  async ({ calculatorFlowPage, recordedAnswers }, dateValue: string, question: string) => {
+    recordDateAnswer(recordedAnswers, question, dateValue);
+    await calculatorFlowPage.fillDateAndContinue(question, dateValue);
+  },
+);
+```
+
+`recordNumericAnswer` and `recordDateAnswer` are small lookup functions - a question's exact wording maps to exactly one field on `RecordedAnswers`:
+
+```typescript
+const NUMBER_FIELD_BY_QUESTION: Record<string, NumberField> = {
+  'Number of days worked per week?': 'workingDaysPerWeek',
+  'Number of hours worked per week?': 'hoursPerWeek',
+  'How many hours in each shift?': 'hoursPerShift',
+  'How many shifts will be worked per shift pattern?': 'shiftsPerShiftPattern',
+  'How many days in the shift pattern?': 'daysPerShiftPattern',
+  'How many hours has the employee worked in the pay period?': 'hoursInPayPeriod',
+};
+
+export function recordNumericAnswer(answers: RecordedAnswers, question: string, value: string): void {
+  const field = NUMBER_FIELD_BY_QUESTION[question];
+  if (field) answers[field] = Number(value);
+}
+```
+
+A question not in the table is silently ignored rather than erroring, which matters in practice: it means adding an unrelated new question elsewhere in the wizard can never break an existing recording step.
+
+By the time the scenario reaches its final assertion, `recordedAnswers` holds everything entered so far. The `Then` step for the "days worked per week" method reads exactly the fields it needs and hands them to the ported calculation function:
+
+```typescript
+// steps/calculator-assertions.steps.ts
+Then(
+  'the outcome matches the computed entitlement using the days worked per week method',
+  async ({ calculatorFlowPage, recordedAnswers }) => {
+    const expected = daysPerWeekOutcome({
+      workingDaysPerWeek: requireNumber(recordedAnswers.workingDaysPerWeek, 'Number of days worked per week?'),
+      startDate: recordedAnswers.startDate,
+      leavingDate: recordedAnswers.leavingDate,
+      leaveYearStartDate: recordedAnswers.leaveYearStartDate,
+    });
+    const outcome = calculatorFlowPage.getOutcomeText(expected, { exact: true });
+    await expect(outcome).toBeVisible();
+  },
+);
+```
+
+`requireNumber` is the deliberate failure mode for the alternative to all this: if a scenario reaches this step without having entered a required value - most likely because it's missing a `When` step, or is using the wrong "using the `<method>` method" step for its basis - this throws immediately, naming the missing question, instead of letting `undefined` silently flow into the calculation and produce a confusing `NaN` several steps later:
+
+```typescript
+export function requireNumber(value: number | undefined, question: string): number {
+  if (value === undefined) {
+    throw new Error(`Expected "${question}" to have been entered before this step`);
+  }
+  return value;
+}
+```
+
+Every entered answer also ends up on GOV.UK's own "Your answers" summary, shown on every question page from the second question onward - the real page after the same four-question scenario used above:
+
+![GOV.UK's "Your answers" table showing four rows: the irregular-hours question answered "No", the basis answered "days worked per week", the coverage answered "for a full leave year", and the days-per-week question answered "5.0", each with a Change link](/blog/govuk-calculator-bdd-test-design/govuk-your-answers-table.png)
+_Every answer a scenario enters lands here too - the same recorded values the fixture threads through to the final calculation are independently visible on the real page, which is what "the answer summary shows... answered..." assertions check against._
+
+## Stable Labels: Decoupling Feature Files from Live Wording
+
+Every question and answer-summary row above is located by its accessible name or heading text - `page.getByRole('textbox', { name: 'Number of days worked per week?' })`. If that were wired up naively, direct from the `.feature` file's string straight into a locator call, then the day GOV.UK reworded so much as one question, every feature file referencing it would need editing, and the failure would show up as a confusing locator-not-found error with no clue that the *wording*, not the *logic*, had changed.
+
+`support/questionLabels.ts` is a single indirection point between the two:
+
+```typescript
+// Maps each question's stable label - the exact string every .feature
+// file uses to identify a field, e.g. "Number of days worked per week?"
+// in `the user enters "5" for "Number of days worked per week?"` - to
+// that question's current live wording on the actual GOV.UK page (the
+// accessible name/heading/link text Playwright looks it up by):
+//   QUESTION_LABELS['<label used in .feature files>'] = '<current live wording on GOV.UK>'
+const QUESTION_LABELS: Record<string, string> = {
+  'Does the employee work irregular hours or for part of the year?':
+    'Does the employee work irregular hours or for part of the year?',
+  'Number of days worked per week?': 'Number of days worked per week?',
+  'How many hours in each shift?': 'How many hours in each shift?',
+  // ...one entry per question across the whole wizard
+};
+
+export function resolveQuestion(label: string): string {
+  return QUESTION_LABELS[label] ?? label;
+}
+```
+
+Every entry today happens to have an identical left- and right-hand side, since GOV.UK's live wording hasn't yet diverged from what the suite was written against - but they're two logically distinct things, and the map is what makes that distinction real rather than aspirational. `CalculatorFlowPage` and the `AnswerSummary` component both resolve *every* question parameter through this function rather than using the step's string directly:
+
+```typescript
+// pages/CalculatorFlowPage.ts
+getTextbox(question: string) {
+  return this.page.getByRole('textbox', { name: resolveQuestion(question), exact: true });
+}
+```
+
+```typescript
+// components/AnswerSummary.ts
+getAnswer(question: string): Locator {
+  return this.page
+    .getByRole('term')
+    .filter({ hasText: resolveQuestion(question) })
+    .locator('xpath=..')
+    .getByRole('definition')
+    .first();
+}
+```
+
+A wording change on GOV.UK's side becomes a one-line edit to the right-hand side of one entry in `questionLabels.ts`, rather than a find-and-replace across every `.feature` file that mentions that question. A label with no entry in the map passes through unchanged, so a brand-new question elsewhere in the wizard works immediately without anyone having to remember to register it first.
+
+![The live GOV.UK question page asking "Does the employee work irregular hours or for part of the year?" with Yes/No radio buttons](/blog/govuk-calculator-bdd-test-design/govuk-first-question.png)
+_The live page's heading, word for word, is the value side of `questionLabels.ts`'s first entry - the feature file's `Given`/`Then` steps reference the same string as the stable key on the left._
+
+## A Gherkin-Native HTML Report
+
+Playwright's own HTML reporter is built around generated test titles - useful for debugging, less useful for handing to someone who thinks in terms of the actual scenarios. `playwright-bdd` ships a `cucumberReporter` that renders the real Given/When/Then wording instead, with a pass/fail icon and duration per step:
+
+```typescript
+// playwright.config.ts
+reporter: [
+  ['html', { open: 'never', outputFolder: 'playwright-report' }],
+  ['list'],
+  ['./reporters/cucumber-gherkin-reporter.ts', { $type: 'html', outputFile: 'cucumber-report/index.html' }],
+],
+```
+
+Generation is automatic - every `playwright test` run writes `cucumber-report/index.html` alongside the standard report, with every screenshot/trace attachment embedded inline rather than referenced externally, so the single file is self-contained and opens directly in a browser with no server needed:
+
+![Overview of the generated Gherkin HTML report: 100% (9/9) passed, listing two feature files as collapsible groups](/blog/govuk-calculator-bdd-test-design/cucumber-report-overview.png)
+_Each `.feature` file becomes a collapsible group; expanding one reveals every `Scenario`/`Scenario Outline` example as its own pass/fail entry._
+
+Expanding a scenario shows exactly what ran, in the language the feature file used to describe it - not a generated test title:
+
+![An expanded scenario in the report titled "Starting and leaving within the same leave year asks for both dates", showing every Given/When/Then step with a green tick and a duration, including two "the answer summary shows..." assertions at the end](/blog/govuk-calculator-bdd-test-design/cucumber-report-scenario-detail.png)
+_This is the same scenario shape described in the recorded-answers section above: several `When` steps enter values on separate pages, and the final `Then` steps assert against them - each step's own duration is visible, which is genuinely useful for spotting an unusually slow page in a long scenario._
+
+`['./reporters/cucumber-gherkin-reporter.ts', ...]` rather than playwright-bdd's own `cucumberReporter()` helper directly is deliberate, and is the subject of the first item below.
+
+## Verifying Outbound Links Are Both Live and Relevant
+
+The outcome page ends with a GOV.UK "Related content" panel of links to other guidance pages. It's easy to assert those links merely *exist*; two separate `Then` steps in this suite go further; one checks they don't 404, the other checks they land somewhere actually related to their own link text.
+
+![The "Related content" panel on the outcome page: four links - "Calculate your agricultural worker holiday entitlement", "Holiday entitlement", "Night working hours", "Sunday working"](/blog/govuk-calculator-bdd-test-design/govuk-related-content.png)
+_These four links are what the two steps below check on every outcome page - live, and relevant to their own text._
+
+The first uses Playwright's `request` fixture - an API context, not a browser page - to check every link responds successfully, without the overhead of a full page navigation per link:
+
+```typescript
+Then('every content link on the outcome page responds successfully', async ({ calculatorFlowPage, request }) => {
+  const links = await calculatorFlowPage.getContentLinks().all();
+  expect(links.length).toBeGreaterThan(0);
+
+  for (const link of links) {
+    const href = await link.getAttribute('href');
+    const name = await link.textContent();
+    const response = await request.get(href ?? '');
+    expect(response.ok(), `"${name}" (${href}) responded with ${response.status()}`).toBeTruthy();
+  }
+});
+```
+
+The second is the more interesting one: a link being reachable doesn't mean it goes anywhere *sensible*. This step opens each destination in a fresh page (via `page.context().newPage()`, so it doesn't disturb the outcome page currently under test), reads the destination's own `<h1>`, and checks for word overlap between the link's own text and that heading:
+
+```typescript
+Then(
+  'every content link on the outcome page leads to a page relevant to its link text',
+  async ({ calculatorFlowPage, page }) => {
+    const links = await calculatorFlowPage.getContentLinks().all();
+
+    for (const link of links) {
+      const name = ((await link.textContent()) ?? '').trim();
+      const href = await link.getAttribute('href');
+
+      // Stem each meaningful word (dropping short connectives like "on"/
+      // "how"/"is") so the link's own wording can be checked for overlap
+      // with the destination heading without requiring an exact phrase
+      // match - link text and page headings are rarely worded identically.
+      const stems = name
+        .split(/\s+/)
+        .map((word) => word.replace(/[^a-zA-Z]/g, '').toLowerCase())
+        .filter((word) => word.length >= 4)
+        .map((word) => word.slice(0, 5));
+
+      const destination = await page.context().newPage();
+      await destination.goto(href ?? '');
+      const heading = destination.getByRole('heading', { level: 1 }).first();
+      await expect(heading).toBeVisible();
+      const headingText = ((await heading.textContent()) ?? '').toLowerCase();
+      await destination.close();
+
+      expect(
+        stems.some((stem) => headingText.includes(stem)),
+        `"${name}" (${href}) landed on unrelated heading "${headingText}"`,
+      ).toBeTruthy();
+    }
+  },
+);
+```
+
+Stemming to a five-character prefix rather than requiring an exact word match is deliberate: link text and destination headings are rarely worded identically on GOV.UK ("Calculate your agricultural worker holiday entitlement" links to a page headed "Calculate holiday entitlement for agricultural workers"), and a full-phrase comparison would fail on word order alone. Cutting each word to its first five characters catches "agricultural"/"agricultural" and "worker"/"workers" as the same stem without needing a real stemming library, while still rejecting a link that's genuinely landed somewhere unrelated. Short connective words (under four characters) are dropped before stemming, since matching on "for" or "the" would make almost any two headings look related.
+
+Both steps together catch two different failure modes a simpler "link exists" assertion would miss entirely: a moved or removed destination page (first step), and a correct-looking link that's been silently repointed at the wrong content (second step) - a class of bug that's easy to introduce by accident (a copy-paste href) and easy for a purely visual review to miss, since the link text on the page under test never changes.
+
+## Challenges Along the Way
+
+### The Cucumber Reporter Assumed Every Test Was BDD-Generated
+
+This suite deliberately mixes BDD-generated specs with hand-written plain specs (a seed spec, an accessibility test suite, unit tests for the `calculators/` modules) inside the same Playwright `testDir` - a documented, intentional choice, not an oversight. `playwright-bdd`'s own `cucumberReporter`, wired in directly, turned out not to expect that: it processes every test in the run and throws if a test's source file doesn't carry the `// Generated from: <feature uri>` header that `bddgen` stamps onto BDD-generated files.
+
+Confirmed live, not just read about: running two hand-written tests from `seed.spec.ts` under a tag filter passed both tests, but the process still exited `1`, printing `Error: Cannot find feature uri in file: .../seed.spec.ts` once per plain-spec test. The reporter's built-in escape hatch only skips whole *projects* whose `testDir` isn't a registered BDD output directory - which never fires here, since the plain specs deliberately share the exact same `testDir` as the generated ones.
+
+The fix was a thin wrapper reporter (`reporters/cucumber-gherkin-reporter.ts`, referenced directly in the config above) that forwards only tests whose source file lives under a `features/` folder to the real reporter, silently skipping everything else instead of crashing:
+
+```typescript
+export default class GherkinReporter implements Reporter {
+  private delegate: Reporter;
+
+  constructor(options: ConstructorParameters<typeof CucumberReporterAdapter>[0]) {
+    this.delegate = new CucumberReporterAdapter(options);
+  }
+
+  onTestEnd(test: TestCase, result: TestResult) {
+    if (!test.location.file.includes(`${path.sep}features${path.sep}`)) return;
+    this.delegate.onTestEnd?.(test, result);
+  }
+
+  // onBegin/onError/onEnd/printsToStdio all delegate unconditionally
+}
+```
+
+### Generated Specs Are Gitignored - and CI Forgot to Generate Them
+
+BDD-generated spec files (`tests/features/**`) are a build artifact, not source, so they're gitignored. That's correct - but it means a CI workflow that runs the test scripts straight after `npm ci`, with no explicit generation step in between, silently has zero BDD-generated tests to run. Checking this project's own GitHub Actions history confirmed exactly that had happened: the `@e2e`-tagged run failed outright with `Error: No tests found`, while the `@smoke`-tagged run - which also matches some hand-written plain specs - stayed green while quietly running 10 tests instead of the 26 actually tagged. The second failure mode is the more dangerous of the two, precisely because "fewer tests than expected but still green" doesn't fail a CI job on its own. The fix was one missing step, `npm run bdd:gen`, added before the lint/test steps - obvious in hindsight, easy to omit the first time a BDD suite is wired into CI, and invisible until someone actually reads the run's test counts rather than just its pass/fail colour.
+
+## Key Takeaways
+
+**A fixture is the right place for state that spans a scenario's own steps.** playwright-bdd fixtures don't automatically carry data between `Given`/`When`/`Then` calls - each step only sees the fixtures it declares. A plain object fixture, freshly created per test, is a clean way to let an early step's input reach a much later step's assertion without smuggling it through a global or re-deriving it from the page.
+
+**Assert against an independently computed value, not a copied-down string.** The final step calls the same ported calculation logic the application should be using, rather than a hardcoded expected string written by hand. A hardcoded string only proves the page still says what it said when the test was written; a computed comparison proves the *logic* is still right.
+
+**Never let a `.feature` file's wording be the same string as a live locator's wording.** A single resolve function between the two means a copy change on the real site is a one-line fix, not a find-and-replace across every scenario that mentions the affected question - and the failure mode without it (a locator silently not matching after a rewording) is much harder to diagnose than a wrong test-plan reference.
+
+**A Gherkin-native report earns its place for stakeholders who don't read generated test titles.** `playwright-bdd`'s `cucumberReporter` renders the actual Given/When/Then text with pass/fail and duration per step. It's a strict improvement in readability *only* when every test it processes really is BDD-generated - see the first challenge above for what happens the moment that's no longer true.
+
+**"The link exists" and "the link is correct" are different assertions.** A link that 404s and a link that's been quietly repointed at the wrong page are both real defects, and neither is caught by checking only that a `Related content` section renders with the right number of items in it. Cheap word-stemming, not a full NLP library, was enough to catch the second case without excessive false positives from GOV.UK's own inconsistent link-to-heading phrasing.
+
+**A build artifact being gitignored is only half the story - something still has to build it, everywhere the suite runs.** It's easy to verify generation locally (the files are just sitting there from the last time you ran it) and forget that a fresh CI checkout starts from nothing. The failure mode is worse than a hard failure when it's a tag filter that also matches other, non-generated tests - the run stays green while quietly testing less than it claims to.
+
+## The Code
+
+The full test suite is on GitHub: [github.com/pyardley/solirius-qe-ui-technical-task](https://github.com/pyardley/solirius-qe-ui-technical-task)
+
+Relevant files:
+
+- `support/scenarioInputs.ts` - the `RecordedAnswers` interface, `createRecordedAnswers`, and the record/require helpers
+- `support/questionLabels.ts` - the stable-label-to-live-wording map and `resolveQuestion`
+- `fixtures/fixtures.ts` - the `recordedAnswers` fixture registration and the shared `createBdd(test)` step bindings
+- `steps/calculator-flow.steps.ts` / `steps/calculator-assertions.steps.ts` - the recording `When` steps and the computing `Then` steps
+- `calculators/` - the pure, ported calculation modules each `Then` step calls into
+- `playwright.config.ts` / `reporters/cucumber-gherkin-reporter.ts` - the Gherkin HTML report wiring and its mixed-spec-safe wrapper
