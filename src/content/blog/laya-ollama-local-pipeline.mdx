@@ -1,0 +1,323 @@
+---
+title: "A Local Decision + Generation Pipeline with Laya and Ollama"
+description: "A quick how-to for running Laya, an open-source 'System 1' decision model, alongside Llama 3.1 in Ollama: Laya classifies and routes a customer-support ticket in half a second, and the LLM is only called when a written response is needed. Fully local, on CPU, with no API keys."
+pubDate: 2026-09-26
+author: "Paul Yardley"
+tags: ["AI", "Local LLM", "Ollama", "LangChain", "Python", "AI Agents"]
+readingTime: "8 min read"
+draft: false
+---
+
+A lot of LLM pipelines use a big generative model for jobs that are really multiple-choice questions. Should this ticket get an automatic reply, go to a human, or be ignored? Asking an 8B-parameter model to reason its way to a JSON answer for that is slow, and the output then has to be parsed.
+
+This guide sets up a small, fully local demo that splits the work in two:
+
+1. **[Laya](https://huggingface.co/convaiinnovations/laya)** makes the decision. It scores a support ticket against a set of options you describe in plain English, and returns a choice with a calibrated probability for each option.
+2. **[Ollama](https://ollama.com/)**, running Llama 3.1 8B, writes text - but only when the decision calls for it.
+
+Everything runs locally. No API keys are needed, and no ticket data leaves the machine. The finished code is on GitHub at [pyardley/laya-ollama-demo](https://github.com/pyardley/laya-ollama-demo).
+
+## What Laya Is
+
+Laya is an open-source alternative to **Jev**, a commercial model from TypeSafe AI. Both are "System 1" decision models: fast functions for application logic, not text generators. You give them unstructured input (a ticket, an email, a JSON payload) plus predefined questions, and they return structured answers with probabilities. Question types include `choice` (pick one option), `score` (rate against a rubric) and yes/no.
+
+Because every possible answer is defined up front, there's no free-text output to parse. Calibrated probabilities are the main point: when they're trustworthy, software can act automatically on confident decisions and send uncertain ones to a person. Laya's package metadata describes it as a "fast, non-autoregressive System 1 decision engine with calibrated probabilities".
+
+## Setup
+
+You need Python (this was tested on 3.14 on Windows) and [Ollama](https://ollama.com/download).
+
+```bash
+git clone https://github.com/pyardley/laya-ollama-demo.git
+cd laya-ollama-demo
+pip install -r requirements.txt
+ollama pull llama3.1:8b
+```
+
+`requirements.txt` pins the two versions this was tested with:
+
+```text
+laya==0.3.20
+langchain-ollama==1.1.0
+```
+
+That's all Laya needs. It depends on PyTorch, Transformers and a few smaller packages, which pip installs for you. You don't need `onnxruntime` or `onnxruntime-gpu`: those are only for Laya's optional ONNX mode, which this demo doesn't use. The Laya weights (`convaiinnovations/laya`) download from Hugging Face the first time you run the script.
+
+## How the Script Works
+
+The script, `laya_demo.py`, has four parts: ask Laya a question, read the answer, act on it, and report timings.
+
+### 1. Ask Laya a question
+
+```python
+agent = load("convaiinnovations/laya", device="cpu")
+
+decision = agent.predict(
+    state=ticket,
+    questions={
+        "action": {
+            "instructions": "What action should be taken for this customer support ticket?",
+            "type": "choice",
+            "criteria": {
+                "auto_reply": "The issue is simple and can be addressed automatically.",
+                "escalate_to_human": "The hardware issue or replacement request needs a human agent.",
+                "ignore": "The message is spam or completely irrelevant."
+            }
+        }
+    }
+)
+```
+
+Each option under `criteria` is just a plain-English description, and Laya scores the ticket against each one. Adding a route - say `refund_request` - means adding one line. You can ask several questions in one `predict` call, by adding more keys alongside `"action"`.
+
+### 2. Read the answer - and use the right confidence field
+
+```python
+action_data = decision["answers"]["action"]
+chosen_action = action_data["choice"]
+probabilities = action_data["probabilities"]
+# 'answer_confidence' is max(p), the calibrated value that is safe to threshold on.
+# 'confidence' is normalised entropy over all options and is NOT calibrated.
+answer_confidence = action_data.get("answer_confidence", 0)
+```
+
+This is the easiest thing to get wrong. A `choice` answer has two confidence fields, and the obvious-sounding one is not the one you want:
+
+| Field | What it is | Calibrated? |
+| --- | --- | --- |
+| `answer_confidence` | `max(p)`: the probability of the chosen answer | Yes. Safe to set a threshold on. |
+| `confidence` | Normalised entropy, `1 - H(p) / ln(k)`: how concentrated the whole distribution is | No |
+
+For the example ticket below, `answer_confidence` is 78.1% but `confidence` is 38.5%. Laya's source says the two "must not be compared against the same threshold". Always gate decisions on `answer_confidence`.
+
+### 3. Act on the decision
+
+Each outcome gets its own behaviour, and a confidence gate comes first:
+
+| Condition | What happens |
+| --- | --- |
+| `answer_confidence` below 70% | Goes to a human for review, whatever Laya chose. Ollama drafts an internal handoff note that includes Laya's probabilities. No customer reply is sent. |
+| `auto_reply` | Ollama drafts a customer reply ready to send. |
+| `escalate_to_human` | The customer gets a fixed holding reply, and Ollama drafts an internal handoff note for the agent. |
+| `ignore` | Nothing. |
+
+```python
+CONFIDENCE_THRESHOLD = 0.70
+
+if answer_confidence < CONFIDENCE_THRESHOLD:
+    # Not sure enough to act on any route - including telling the customer anything.
+    # A human decides; they get Laya's full probability spread as context.
+    spread = ", ".join(f"{k} {v:.0%}" for k, v in probabilities.items())
+    draft_handoff_note(f"An automated classifier was unsure how to handle it ({spread}).")
+
+elif chosen_action == "auto_reply":
+    prompt = (
+        f"A customer reported: '{ticket}'. Write a short, polite, professional support email "
+        "reply that resolves the issue. Output only the email body, with no preamble. "
+        "Do not use placeholders such as [Customer's Name]; open with 'Hello,' and sign off "
+        "as 'Customer Support Team'."
+    )
+    print_block("OLLAMA AUTO-REPLY (ready to send)", ask_ollama(prompt))
+
+elif chosen_action == "escalate_to_human":
+    # A fixed holding reply: nothing for the LLM to get wrong, and no promises about a fix.
+    print_block("HOLDING REPLY TO CUSTOMER", HOLDING_REPLY)
+    draft_handoff_note("It has been escalated to you by an automated classifier.")
+
+else:
+    print("Action evaluated as 'ignore'. No response generated.")
+```
+
+(The `print` status lines are left out here for brevity.) Three design choices are worth copying:
+
+- **The confidence gate comes before every route**, including the customer-facing ones. If the system isn't sure, it shouldn't tell the sender anything either - otherwise a low-confidence spam message gets a polite "a specialist will contact you" reply.
+- **The holding reply is a fixed string, not LLM output.** It's the one message a customer sees on the escalation route, so it shouldn't be able to go wrong.
+- **An escalation produces a note for the agent, not a draft for the customer.** The handoff prompt asks for four fixed headings:
+
+```python
+def draft_handoff_note(context):
+    prompt = (
+        f"You are helping triage a customer support ticket for a human agent. The ticket says: '{ticket}'.\n"
+        f"{context}\n"
+        "Write a concise internal handoff note for the agent - not a reply to the customer. "
+        "Use exactly these headings:\n"
+        "Summary: (one line)\n"
+        "Likely cause:\n"
+        "Questions to ask the customer:\n"
+        "Suggested next step:\n"
+        "Output only the note, with no preamble."
+    )
+    print_block("OLLAMA HANDOFF NOTE (internal, for the agent)", ask_ollama(prompt))
+```
+
+### 4. Time each phase
+
+The script times each phase with a small `timed` context manager built on `time.perf_counter()`, and prints a summary at the end. The clock starts before the `laya` import, because importing PyTorch takes several seconds by itself. Ollama calls go through `ask_ollama()`, which uses LangChain's `generate()` instead of `invoke()`. `invoke()` returns only the text, while `generate()` also returns Ollama's own timing figures. Those split each call into model loading, prompt processing and text generation:
+
+```python
+def ask_ollama(prompt):
+    with timed("Ollama call (wall clock)"):
+        result = ollama_llm.generate([prompt])
+    generation = result.generations[0][0]
+    info = generation.generation_info or {}
+    for key, label in [("load_duration", "  of which: Ollama model load"),
+                       ("prompt_eval_duration", "  of which: Ollama prompt processing"),
+                       ("eval_duration", "  of which: Ollama text generation")]:
+        if info.get(key):
+            timings[label] = timings.get(label, 0) + info[key] / 1e9  # ns -> s
+    ...
+    return generation.text
+```
+
+## Running It
+
+```bash
+python laya_demo.py                                   # the default ticket
+python laya_demo.py "How do I reset my password?"     # or your own
+```
+
+Here's a full run with the default ticket, a hardware complaint:
+
+```text
+Loading models...
+Fetching 5 files: 100%|██████████| 5/5 [00:00<00:00, 53227.21it/s]
+...\laya\agent.py:928: RuntimeWarning: laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]; using choice:11+=0.10058280825614929 -> 0.5. Treat confidence from the affected entries as uncalibrated.
+
+============================================================
+ 📥 INPUT TICKET
+============================================================
+"My speaker crackles when playing audio."
+
+============================================================
+ 🤖 LAYA DECISION ANALYSIS
+============================================================
+Primary Recommendation : ESCALATE_TO_HUMAN
+Confidence Score       : 78.1%
+
+Probability Breakdown:
+  • escalate_to_human  [███████████████████████░░░░░░░]  78.1%  👈 (Selected)
+  • auto_reply         [███░░░░░░░░░░░░░░░░░░░░░░░░░░░]  12.0%
+  • ignore             [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   9.8%
+
+============================================================
+ 🚀 EXECUTION ROUTE
+============================================================
+Action triggered: Escalating to a human agent.
+
+------------------------------------------------------------
+ HOLDING REPLY TO CUSTOMER
+------------------------------------------------------------
+Hello,
+
+Thank you for getting in touch. Your message has been passed to one of our support
+specialists, who will contact you directly to help resolve this.
+
+Customer Support Team
+------------------------------------------------------------
+
+Invoking Ollama to draft an internal handoff note...
+
+[Ollama generated 118 tokens at 6.9 tokens/s]
+
+------------------------------------------------------------
+ OLLAMA HANDOFF NOTE (internal, for the agent)
+------------------------------------------------------------
+**Summary:** Speaker crackling issue when playing audio
+
+**Likely cause:** Possible faulty or damaged speaker driver, loose connections, or interference from nearby devices.
+
+**Questions to ask the customer:**
+- Can you describe the audio content when the crackling occurs?
+- Are there any other symptoms or issues with the speaker?
+- Have you made any recent changes to the device or its environment?
+
+**Suggested next step:** Have the customer provide more details on the issue and try basic troubleshooting steps (e.g., checking cable connections, restarting the device, and ensuring proper speaker placement).
+------------------------------------------------------------
+
+============================================================
+ ⏱️ TIMING
+============================================================
+  Import libraries (torch, transformers, langchain)     3.87s
+  Load Laya model (download check + weights)            9.63s
+  Laya decision (predict)                               0.55s
+  Ollama call (wall clock)                             17.63s
+    of which: Ollama model load                         0.01s
+    of which: Ollama prompt processing                  0.35s
+    of which: Ollama text generation                   17.22s
+  Everything else (printing, small imports)             0.73s
+  TOTAL                                                32.43s
+============================================================
+```
+
+The ticket names a hardware fault, which matches the `escalate_to_human` description, so Laya picks it clearly: 78.1%, well above the 70% threshold. The customer gets the holding reply, and the agent gets a structured starting point. The handoff note is written fresh on every run, so its wording will differ each time. The Laya decision is identical on every run.
+
+## Performance
+
+The main reason for this design is that the decision step is cheap and text generation is expensive. Here are two runs of the same ticket on a laptop with a 4 GB GTX 1650 Ti. In the first, Ollama had to load llama3.1 into memory ("cold"). In the second, it was still loaded from the first run ("warm"):
+
+| Phase | Ollama cold | Ollama warm |
+| --- | ---: | ---: |
+| Import libraries | 4.11s | 3.61s |
+| Load Laya model | 10.82s | 9.80s |
+| **Laya decision (`predict`)** | **0.72s** | **0.52s** |
+| Ollama call, total | 46.89s | 18.34s |
+| &nbsp;&nbsp;of which: model load | 29.99s | 0.01s |
+| &nbsp;&nbsp;of which: prompt processing | 1.74s | 0.31s |
+| &nbsp;&nbsp;of which: text generation | 15.07s | 17.96s |
+| **Total** | **63.40s** | **33.00s** |
+
+What the numbers show:
+
+- **The decision is 20-35 times faster than generation.** Laya's `predict` takes about half a second on CPU, while a roughly 120-token note takes 15-18 seconds. Every ticket that's ignored, or handled with a fixed reply, avoids that cost entirely.
+- **Most of Laya's time is start-up.** Imports and model loading take about 14 seconds on every run. A long-running service pays that once, and after that each ticket costs only the half-second `predict`.
+- **Ollama's first call includes loading the model.** That took 30 seconds on the cold run and 0.01 seconds on the warm one. Ollama unloads an idle model after 5 minutes by default, so how long you wait between runs can halve or double the total.
+- **Generation speed is a hardware limit.** `ollama ps` shows llama3.1 8B needs 5.6 GB, split 58% CPU / 42% GPU on a 4 GB card, which is why it manages only about 7 tokens/s. A smaller or more heavily quantised model, or a GPU with more memory, would make the biggest difference.
+
+These are single runs on one machine, so read them as rough proportions, not benchmarks.
+
+## Things to Know
+
+**The `RuntimeWarning` on start-up doesn't affect this demo.** Laya calibrates probabilities separately for each question type and number of options (2, 3-5, 6-10, 11+). The published checkpoint ships an invalid calibration value for `choice` questions with 11 or more options. A comment in Laya's source says that, left alone, it would make "a 0.24 top probability [be] published as 0.99". So Laya replaces it with a safe value and warns you. This demo's three-option question isn't affected, but a router with 11 or more destinations would be.
+
+**Test the easy routes too.** Two more tickets show a clear bias. Output is trimmed to the decision:
+
+```text
+$ python laya_demo.py "How do I reset my password?"
+  • escalate_to_human  61.5%  👈 (Selected)
+  • ignore             19.4%
+  • auto_reply         19.1%
+Confidence 61.5% is below the 70% threshold: sending to a human for review. No customer reply sent.
+
+$ python laya_demo.py "CONGRATULATIONS!!! You have won a free cruise, click here to claim now"
+  • escalate_to_human  43.8%  👈 (Selected)
+  • ignore             42.2%
+  • auto_reply         14.0%
+Confidence 43.8% is below the 70% threshold: sending to a human for review. No customer reply sent.
+```
+
+A password reset is a textbook FAQ, yet `auto_reply` ranks last. Obvious spam still leans slightly towards escalation. The confidence gate catches both, so nothing wrong goes out, but none of the tickets tried so far has reached the `auto_reply` route. My best guess is the option wording. `escalate_to_human` names a concrete kind of issue, while `auto_reply` just says "simple". Making each description equally specific, then testing against a small set of tickets where you already know the right answer, is the obvious next step. The descriptions in `criteria` are effectively part of the model's input, so test them like code.
+
+**Review the LLM output.** The handoff notes are generally useful, but they're LLM output and can misread a ticket. For the spam example, the note correctly called it a likely phishing attempt, then suggested asking "the customer" whether they'd been asked for personal details. It treated the spammer as a customer who had *received* the email.
+
+## Key Takeaways
+
+- **Use a decision model for decisions, and an LLM for text.** A dedicated classifier returns a structured answer in half a second. Keeping the LLM behind it means the slow, expensive call only runs when needed.
+- **Check which confidence field is calibrated before setting a threshold.** Here, two fields that both sound like certainty gave 38.5% and 78.1% for the same answer.
+- **Put the confidence gate in front of every action.** When the system is unsure, the safe default is to tell a human and tell the sender nothing.
+- **Make each route do something different.** Customers, agents and spammers need different outputs. A fixed string is often the right answer where an LLM would add risk without adding value.
+- **Measure start-up separately from the work.** The decision took 0.5 seconds, yet the script took 33-63. Almost none of that was the decision, and 30 seconds of it depended only on whether the LLM was already loaded.
+- **Fully local works for this.** Both models ran on a laptop, without API keys or rate limits, and no ticket data left the machine.
+
+## The Code
+
+Everything is in [pyardley/laya-ollama-demo](https://github.com/pyardley/laya-ollama-demo):
+
+- `laya_demo.py` - the complete script: decision, routing, handoff notes and timing
+- `requirements.txt` - pinned `laya` and `langchain-ollama` versions
+- `README.md` - setup steps and a quick reference for routing and confidence fields
+
+The libraries:
+
+- [`laya`](https://huggingface.co/convaiinnovations/laya) (v0.3.20) - the decision model; weights from `convaiinnovations/laya` on Hugging Face
+- [`langchain-ollama`](https://pypi.org/project/langchain-ollama/) (v1.1.0) - the `OllamaLLM` wrapper used for generation
+- [Ollama](https://ollama.com/) running `llama3.1:8b` locally
