@@ -1,0 +1,135 @@
+---
+title: "AI in Testing: A Use-Case Map of What I've Actually Tried (and What's Still Missing)"
+description: "I was asked for a list of AI-in-testing use cases - test data generation, acceptance criteria generation, test case generation and the rest. Rather than write it from a mental model, I went through all 24 posts on this blog to see which of them were actually already here, which posts turned out to be AI-built without ever saying so, and which standard use cases are conspicuously absent."
+pubDate: 2026-08-03
+author: "Paul Yardley"
+tags:
+  [
+    "AI",
+    "AI Agents",
+    "Test Automation",
+    "QA Engineering",
+    "Test Strategy",
+    "Claude Code",
+    "RAG",
+  ]
+readingTime: "12 min read"
+draft: false
+---
+
+Someone asked me for a list of AI-in-testing use cases - the standard ones you'd expect on any such list: test data generation, acceptance criteria generation, test case generation. My first instinct was to write that list from memory. My second was that I had a better source sitting right here: two years of blog posts about testing, most of which involve AI somewhere, none of which were ever organised as a use-case catalogue.
+
+So instead of guessing, I went through all 24 posts in this blog's archive and sorted what's actually there. The result was more interesting than the list I'd have written cold. Several categories I'd have called "standard" turned out to be well covered, just never labelled that way. A couple of posts I'd have filed as "not really AI content" turned out to have been built with AI end to end - I just hadn't framed them that way when I wrote them. And a handful of genuinely standard use cases are conspicuously missing, which is its own kind of useful information.
+
+This post is that catalogue: what's here, under what name, and what isn't here yet.
+
+## Test Creation & Planning
+
+**Test case and scenario generation from requirements** is the most literal match for "test case generation" on the standard list, and it's the core loop of the Playwright planner agent - explore an application, work out what's testable, and write a plan - covered in [Playwright AI Agents: How I Used Grok to Explore and Demystify Test Automation's Newest Feature](/blog/playwright-ai-agents-grok) and put to work against a real Oracle APEX app in [Building a Production-Grade Playwright Suite for Oracle APEX with PCOM and AI Agents](/blog/playwright-pcom-apex-sanzu).
+
+**Test script generation** is the planner's sibling: turning a plan (or a live session log) into runnable code. The interesting wrinkle is what happens when you change languages - [Porting Playwright's AI Test Agents to Selenium WebDriver](/blog/selenium-playwright-agents-ruby-cucumber) covers rebuilding the generator to output Ruby/Cucumber/Capybara instead of TypeScript, including a locator translation table that turns out to be the load-bearing part of the whole port.
+
+**Synthetic test data and fixture generation** shows up in a form more deliberate than "give me some fake rows": in [CorporateRAG: Designing a Database to Break My Own RAG System (On Purpose)](/blog/corporate-rag-impact-analysis) I didn't ask Claude to generate a test database, I asked it to write the *prompt* that would generate one - a schema engineered with specific multi-hop dependency traps a shortcut-taking system would get wrong. The same pattern repeats in [OIA: Building a Standalone Oracle Impact-Analysis Tool](/blog/oracle-impact-analysis) against a PL/SQL fixture. This is test data generation aimed at a specific failure mode rather than generic realism.
+
+**Test architecture design assistance** is the least obvious entry here: using an AI agent not to write a test, but to help settle the structure the tests live in. The Page Component Object Model in [Building a Production-Grade Playwright Suite for Oracle APEX with PCOM and AI Agents](/blog/playwright-pcom-apex-sanzu) was shaped specifically to make self-healing work reliably - the architecture decision and the AI-agent workflow were designed together, not bolted on afterwards.
+
+## Self-Healing & Test Maintenance
+
+This is the category with the most entries, which tracks - self-healing is the single most demoed AI-in-testing capability in the industry right now, and it's had the most iterations here too.
+
+**Self-healing locators** - an agent diagnosing a broken selector and fixing the test rather than just failing loudly - appears first in [playwright-ai-agents-grok](/blog/playwright-ai-agents-grok), then gets ported to a framework with no built-in equivalent in [selenium-playwright-agents-ruby-cucumber](/blog/selenium-playwright-agents-ruby-cucumber).
+
+**CI-embedded failure diagnosis** takes healing out of a local dev loop and into the pipeline itself: [Self-Diagnosing CI: Auto-Creating Jira Tickets and Running a Playwright Healer Agent in GitHub Actions](/blog/playwright-healer-jira-github-actions) wires a healer agent directly into a GitHub Actions workflow, and is honest about the gap between "the agent produced a passing diff" and "the diff is actually good code" - five rounds of fixing are described, not one clean pass.
+
+**Automatic defect ticket filing** is the other half of that same post: a failed CI run doesn't just fail, it creates a Jira ticket with the failure details and screenshots attached, closing the loop between "test broke" and "someone (or something) knows about it" without a human filing the report by hand.
+
+## Verification, Oracles & Data Comparison
+
+**AI-generated verification queries from a schema** is a narrow but genuinely useful use case: instead of hand-writing column-by-column comparison SQL, [Using SQL MERGE to Detect Inserts, Updates and Deletes Between Two Tables](/blog/sql-merge-table-differences) has AI generate the `MERGE`/`OUTPUT` query directly from the table structure, then classify every row as an insert, update, or delete.
+
+**Database-state reconciliation as a test oracle** - a technique more than an AI feature, but the thing these AI-generated queries are usually *for* - shows up in [Using SQL EXCEPT to Detect Inserts, Updates and Deletes Between Two Tables](/blog/sql-except-table-differences) and [Building a Sequential Event Query to Verify Database State Across Multiple Tables](/blog/sql-sequential-query-testing).
+
+**End-to-end UI-to-database verification** closes the loop between what a test clicks and what actually landed in storage: [Connecting Playwright Tests to SQL Server: End-to-End Database Verification](/blog/playwright-sql-server-database-testing) wires Playwright directly to SQL Server via `mssql`/`msnodesqlv8` so a UI action can be asserted against the row it should have produced.
+
+## Impact Analysis & Regression Scoping
+
+**Change-impact analysis** - "what actually breaks if I touch this?" - turns out to be one of the deepest veins in the whole archive: [corporate-rag-impact-analysis](/blog/corporate-rag-impact-analysis) and [oracle-impact-analysis](/blog/oracle-impact-analysis) both build systems whose entire job is tracing a dependency chain correctly enough to answer that question for SQL Server and Oracle PL/SQL respectively, rather than just retrieving the most similar-looking chunk of code.
+
+**Dependency and build-order mapping** is the project-management half of the same problem: [Mapping Jira Epic Dependencies: A Link Matrix, a Crossing-Free Graph and a Build Order](/blog/jira-epic-dependency-matrix) turns an Epic's linked child tasks into a matrix, a diagram, and a priority-aware build order - useful for sequencing test work the same way it's useful for sequencing development work.
+
+## Knowledge Retrieval for Testers (RAG)
+
+**Natural-language Q&A across the systems testers actually have to reason about** - Jira, Confluence, SQL Server schema, GitHub code - is the other deep vein: [CorporateRAG](/blog/corporate-rag), its retrieval upgrades in [CorporateRAG Revisited: Query Rewriting, Reranking, and Knowing When to Say "I Don't Know"](/blog/corporate-rag-retrieval-upgrades), and the earlier [Confluence RAG](/blog/confluence-rag) all answer some version of "what does this actually do, and what will asking about it get wrong."
+
+**Direct LLM-to-database querying** is the plumbing underneath a lot of that: [Connecting Claude to a SQL Server Database with FastAPI and the Model Context Protocol](/blog/fastapi-mcp-sql-server-claude) is what makes ad hoc schema investigation from inside a chat possible in the first place.
+
+## AI as the Engineer, Not the Subject
+
+This is the category I almost missed entirely, because it doesn't announce itself. Several posts on this blog aren't *about* AI at all on the surface - they're about k6, or about a Jira dashboard gadget - but the thing being built was itself written with AI doing the typing. That's arguably the single most common AI-in-testing use case in practice, and the easiest one to overlook, because "I had Claude Code write this" so often just becomes "I built this."
+
+Two examples make the point directly. The Flask/psutil/Plotly pipeline in [Lightweight Load Testing on Windows 11](/blog/k6-load-testing-windows-dashboard) and its Docker/Prometheus/Grafana counterpart in [Full-Stack Load Testing on Windows 11](/blog/k6-fullstack-observability-docker-windows) read as pure performance-engineering posts. But my very first attempts at using k6 at all - before either pipeline took the shape described in those posts - leaned on AI to get past the learning curve of an unfamiliar load-testing tool, and the k6 scripts and orchestration code that did make it into both posts were themselves written with an AI agent rather than typed from scratch.
+
+The clearer example is [Building a Custom Jira Dashboard Spacer Gadget with Forge](/blog/jira-spacer-gadget-forge). Nothing in that post mentions AI, but the manifest, both React components, and the fix for the `useProductContext()` timing bug were all written by Claude Code - and so was the actual shipping of it. `forge lint`, `forge deploy`, and `forge install` weren't commands I typed and watched; they were run by the agent as part of getting the gadget onto a live Atlassian site. The "single afternoon from `forge create` to a deployed, working gadget" the post describes is an afternoon of directing an agent, not an afternoon of hand-writing React.
+
+None of that changes what those posts are about. But it's worth naming as its own use case, separate from "AI helps you test": AI as the person actually building the test tooling, the load-test harness, the internal dashboard - the infrastructure testing runs on top of, rather than the thing being tested.
+
+## Standard Use Cases With No Post Here Yet
+
+Most of the "standard" list I'd have named from memory - test data generation, test case generation, self-healing - turned out to already be here, filed under more specific names. What's left is shorter, and more interesting precisely because the infrastructure to fill each gap already half-exists elsewhere in this same archive.
+
+### Acceptance Criteria Generation From Raw User Stories
+
+The BDD posts here - [From Test Suite to Demo Video: Building a Demo Mode for Playwright BDD](/blog/playwright-bdd-demo-mode) and its [Selenium/Cucumber port](/blog/selenium-cucumber-demo-mode) - both start from Gherkin feature files that already exist, with Examples tables already filled in. Neither shows AI doing the step *before* that: reading a raw Jira ticket description and comments and drafting the Given/When/Then acceptance criteria in the first place. That's a genuinely different task from planning a test against an existing UI - it's closer to requirements analysis than test automation - and it's a natural extension of infrastructure I already have. CorporateRAG already indexes Jira; the missing piece is a drafting pass over a ticket's description before the planner agent ever opens a browser, rather than after.
+
+### AI-Driven Visual Regression
+
+[The mcp__playwright-test__ Reference](/blog/playwright-test-mcp-tools-reference) documents `browser_take_screenshot` as a tool already available to every agent, currently used for documentation and failure capture - not for comparison. Traditional visual regression is pixel-diffing, which is notoriously noisy (anti-aliasing, font rendering, a single re-flowed pixel triggering a false failure). The AI version replaces the pixel diff with a vision-capable model looking at a baseline and a candidate screenshot and describing *what kind* of difference it sees - a layout shift, a colour change, missing content, a genuinely broken render - which is closer to what a human reviewer would actually flag. Nothing here builds that pipeline yet, but the screenshot tooling to feed it already exists.
+
+### Flaky-Test Prediction and Risk-Based Test Selection
+
+The impact-analysis posts - [corporate-rag-impact-analysis](/blog/corporate-rag-impact-analysis), [oracle-impact-analysis](/blog/oracle-impact-analysis), and the dependency mapping in [jira-epic-dependency-matrix](/blog/jira-epic-dependency-matrix) - all answer "what does this change touch?" None of them close the loop by feeding that answer into "so which tests should actually run, and in what order?" That's the standard risk-based-testing pitch: rather than running the full regression suite on every change, use the dependency graph to select and prioritise the subset of tests whose blast radius actually overlaps the diff. A related but distinct problem - predicting which tests are *likely to be flaky* from historical pass/fail patterns, so they can be quarantined or given automatic retries rather than blocking a release - isn't touched anywhere here either.
+
+### AI Code Review of the Tests Themselves
+
+Every post about healing or generating tests here is about the application under test, or about a test failing - never about the *quality* of the test code as its own subject. Hard waits, brittle CSS selectors, tests that depend on execution order, missing assertions dressed up as "smoke checks" - these are a distinct anti-pattern review, separate from "does the test pass." I already have a Claude Code skill that does exactly this kind of scan for Playwright suites, but it's never been written up as a blog post in its own right, which makes it the most surprising gap on this list - the tool already exists, the post about it doesn't.
+
+### AI-Assisted Accessibility Testing
+
+`browser_snapshot`, documented in [the MCP tools reference](/blog/playwright-test-mcp-tools-reference), already returns the accessibility tree for a page - every agent here uses it to locate elements, never to evaluate the tree itself. The accessibility tree is also exactly the input a WCAG compliance check needs: missing labels, bad heading order, insufficient contrast relationships, unreachable interactive elements. Nothing here turns that existing snapshot into "here are the accessibility violations on this page and why they matter," even though the raw data is already being pulled on every single agent run.
+
+### Plain-English Test Authoring for Non-Engineers
+
+The planner/generator pipeline still requires someone who knows what a test plan is and how to drive an agent through Playwright's MCP tools - it's AI-assisted authoring for engineers, not authoring for stakeholders. The more ambitious version - a product owner typing "check that a customer can add two items to the cart and see the right total at checkout" into a chat window, with no ticket, no plan file, and no familiarity with locators or test runners, and getting a real, versioned test out the other end - isn't attempted anywhere in this archive. It's a genuinely different interface problem, not just a smaller version of the planner.
+
+### PII-Safe Synthetic Data Generation
+
+The synthetic data work already here - the deliberately-flawed SQL Server and Oracle schemas in [corporate-rag-impact-analysis](/blog/corporate-rag-impact-analysis) and [oracle-impact-analysis](/blog/oracle-impact-analysis) - is built from scratch, engineered to expose a specific bug class. That's a different problem from taking an *existing* production-shaped dataset and generating a realistic, non-identifying replacement for it: preserving the real distributions, correlations, and edge cases a production database has accumulated, while guaranteeing no row can be traced back to a real customer. That's the specific enterprise ask behind "test data generation" that shows up whenever a lower environment needs production-realistic data under GDPR or similar constraints, and it's untouched here.
+
+### Longitudinal Log and Anomaly Analysis Across CI History
+
+The healer agent in [playwright-healer-jira-github-actions](/blog/playwright-healer-jira-github-actions) reads the artifacts from *one* failing run - screenshots, `results.json`, `last-run.json` - and diagnoses that failure. Nothing here looks across weeks or months of CI history to find patterns a single-run view can't see: a test that only fails on Tuesdays, a response time that's crept up 15% over the last twenty runs, a test that passes on retry so consistently it's effectively always flaky but never counted as such. That's a different shape of problem - trend detection across a corpus of run history rather than root-causing a single failure - and the raw material (every run's artifacts) is already being produced; it's just never been aggregated and mined.
+
+## Key Takeaways
+
+1. **Most "standard" AI-in-testing use cases are just familiar problems under specific names.** Test data generation, test case generation, and self-healing all showed up here - just described in terms of the specific bug class or framework they solved, not the generic category label.
+2. **The most common AI-in-testing use case is easy to miss because it doesn't announce itself.** "AI helped build the test tooling" and "I built the test tooling" produce the same finished post unless you deliberately go back and name which one actually happened.
+3. **Gaps cluster where the *interface* changes, not where the *technology* would need to.** Acceptance-criteria drafting, plain-English authoring, and accessibility evaluation are all reachable with tools already documented in this archive (Jira indexing, MCP screenshot and snapshot tools) - what's missing is the specific pipeline connecting them to that use case, not new capability.
+4. **A back catalogue is a better source than a mental model.** Going through 24 posts instead of listing use cases from memory surfaced both broader coverage than expected (impact analysis, RAG-based knowledge retrieval) and a narrower gap list than a generic "AI in testing" article would have produced, because the gaps are specific to what's actually missing here rather than generic industry boilerplate.
+
+## Further Reading
+
+Every post referenced above, grouped by category:
+
+**Test creation & planning** — [playwright-ai-agents-grok](/blog/playwright-ai-agents-grok) · [playwright-pcom-apex-sanzu](/blog/playwright-pcom-apex-sanzu) · [selenium-playwright-agents-ruby-cucumber](/blog/selenium-playwright-agents-ruby-cucumber)
+
+**Self-healing & maintenance** — [playwright-healer-jira-github-actions](/blog/playwright-healer-jira-github-actions)
+
+**Verification & data comparison** — [sql-merge-table-differences](/blog/sql-merge-table-differences) · [sql-except-table-differences](/blog/sql-except-table-differences) · [sql-sequential-query-testing](/blog/sql-sequential-query-testing) · [playwright-sql-server-database-testing](/blog/playwright-sql-server-database-testing)
+
+**Impact analysis & regression scoping** — [corporate-rag-impact-analysis](/blog/corporate-rag-impact-analysis) · [oracle-impact-analysis](/blog/oracle-impact-analysis) · [jira-epic-dependency-matrix](/blog/jira-epic-dependency-matrix)
+
+**Knowledge retrieval (RAG)** — [corporate-rag](/blog/corporate-rag) · [corporate-rag-retrieval-upgrades](/blog/corporate-rag-retrieval-upgrades) · [confluence-rag](/blog/confluence-rag) · [fastapi-mcp-sql-server-claude](/blog/fastapi-mcp-sql-server-claude)
+
+**AI as the engineer** — [k6-load-testing-windows-dashboard](/blog/k6-load-testing-windows-dashboard) · [k6-fullstack-observability-docker-windows](/blog/k6-fullstack-observability-docker-windows) · [jira-spacer-gadget-forge](/blog/jira-spacer-gadget-forge)
+
+**Reference** — [playwright-test-mcp-tools-reference](/blog/playwright-test-mcp-tools-reference)
