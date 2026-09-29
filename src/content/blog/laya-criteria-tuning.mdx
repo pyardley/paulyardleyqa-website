@@ -1,0 +1,235 @@
+---
+title: "Tuning Laya's Option Text Against a Labelled Ticket Set"
+description: "A follow-up to the local Laya and Ollama demo. Fifty labelled support messages, ten wordings of each option, confusion matrices, and a cost matrix. The demo now uses the winning sentences and routes on the top probability. A later section sets that same decision next to TypeSafe Jev."
+pubDate: 2026-09-29
+author: "Paul Yardley"
+tags: ["AI", "Local LLM", "Python", "AI Agents"]
+readingTime: "17 min read"
+draft: false
+---
+
+The [local Laya and Ollama pipeline](/blog/laya-ollama-local-pipeline) routes a support ticket three ways: an automatic reply, a human, or no reply at all. Laya makes that choice from three plain-English descriptions. On the tickets I tried first, it picked `escalate_to_human` every time, including a password reset and an obvious spam message. The 70% confidence gate in that version stopped anything wrong going out to a customer, and it also meant the automatic-reply route never ran.
+
+The option text is part of the model's input, so I treated it like code and tested it. This post is that test: 50 messages with a known right answer, ten wordings of each option, and the counts of what Laya chose against what the message actually was. `laya_demo.py` now uses the wording that won, and it routes on the highest probability instead of that gate.
+
+## The labelled set
+
+Each message is one customer email, labelled by hand before any search:
+
+| Label | Messages | What it covers |
+| --- | ---: | --- |
+| `auto_reply` | 17 | A documented how-to: password reset, pairing, firmware, order lookup, a published policy |
+| `escalate_to_human` | 17 | A person has to act: a fault, a damaged or wrong order, a refund, safety, an account compromise |
+| `ignore` | 16 | Not a customer with a problem: spam, phishing, a sales pitch, recruitment, nonsense |
+
+The original descriptions, the ones in `laya_demo.py` when this search started, are the first wording of each option (`a0`, `e0`, `i0`):
+
+```python
+"auto_reply": "The issue is simple and can be addressed automatically.",
+"escalate_to_human": "The hardware issue or replacement request needs a human agent.",
+"ignore": "The message is spam or completely irrelevant."
+```
+
+The other nine wordings per option are different hypotheses about the boundary, not paraphrases of that sentence. One names concrete FAQ tasks. One lists faults and refunds. One is just "Not a customer support request." Each stays a single sentence, because Laya keeps only the first 48 tokens of an option.
+
+The search score for a message is Laya's `answer_confidence` when the chosen action matches the label, and 0 when it does not. That average rewards being right and being sure. Accuracy and the probability on the true label break ties. A full grid of the ten wordings is 1,000 combinations, and one combination takes about 18 seconds on CPU, so the grid is a few hours. I used coordinate search instead: try every wording of one action while the other two stay fixed, then repeat. It settled on round 3, after 64 combinations and about 22 minutes of model time. That is not a proof that some untried combination in the other 936 is worse. The top two that were tried scored 0.438 and 0.436, so a large hidden gain is unlikely, and a small one is still possible.
+
+## What the original wording does
+
+Rows are the true label. Columns are the action Laya chose. The diagonal is the messages it got right.
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 0 | 17 | 0 |
+| escalate_to_human | 0 | 17 | 0 |
+| ignore | 4 | 10 | 2 |
+
+Nineteen of 50 are right, all of them either a real escalation or one of two ignores. Every how-to is sent to a human. Fourteen of the 16 non-tickets are treated as a customer. Credited confidence is 0.279. Twelve messages clear a 70% gate, and every one of them is an escalation. The gate is doing what it was built for: it refuses to act when the choice is unsure. It cannot create an `auto_reply` decision that the option text never wins.
+
+## The best wording
+
+Coordinate search landed on one sentence each:
+
+```python
+"auto_reply": "A how-to or FAQ: password reset, Bluetooth pairing, order tracking, firmware, or account settings.",
+"escalate_to_human": "Broken hardware, a refund, a safety issue, or an account takeover.",
+"ignore": "Not a customer support request."
+```
+
+Same 50 messages:
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 14 | 2 | 1 |
+| escalate_to_human | 0 | 14 | 3 |
+| ignore | 3 | 0 | 13 |
+
+Forty-one of 50 are right. Credited confidence is 0.438. The original wording was rank 50 of the 64 combinations tried. The off-diagonal cells are the whole remaining problem, nine messages:
+
+- **Two how-tos called an escalation.** "Where is the tracking number on the website?" written in a frustrated tone, and "What hours is customer support open?"
+- **One how-to ignored.** "What is your returns window? I'm not sending anything back, I just want the policy." The refusal in the sentence outweighs the question.
+- **Three real cases ignored.** Someone changed the password and placed an order. A speaker hisses with nothing playing. "Cancel order 88210 and refund me." The escalate sentence names a refund and an account takeover, and these three still lose.
+- **Three non-tickets given an automatic reply.** An SEO pitch, a phishing mail that says "verify your mailbox password", and a company offering to buy returns in bulk. The auto-reply sentence itself says "password reset", and the phishing mail matches those words.
+
+Correct decisions now sit around 0.51 to 0.58 confidence. One of the 50 clears 70%. The gate from the first post, applied to this wording, almost never lets a route run. It was useful while the old wording piled about 0.76 onto escalate for everything. Left in place, it would also block the 41 calls this wording gets right.
+
+Averaging the probabilities of the nearest strong wordings stayed at 40 or 41 out of 50 and repeated these same nine mistakes. They disagree on messages the winner already gets right.
+
+## What the demo does now
+
+`laya_demo.py` uses those three sentences. The 70% check is gone. The script takes the highest-probability action and runs that route, including a call whose confidence is in the 0.5s.
+
+```python
+"criteria": {
+    # Wording from the labelled search (a1 / e3 / i9). One short sentence each:
+    # Laya keeps 48 tokens of an option, and three options stay in the calibrated bucket.
+    "auto_reply": "A how-to or FAQ: password reset, Bluetooth pairing, order tracking, firmware, or account settings.",
+    "escalate_to_human": "Broken hardware, a refund, a safety issue, or an account takeover.",
+    "ignore": "Not a customer support request."
+}
+```
+
+```python
+# 'answer_confidence' is max(p), the calibrated value.
+# 'confidence' is normalised entropy over all options and is NOT calibrated.
+# Route on the highest-probability action. With this wording a correct call usually
+# sits around 0.5-0.6, so a 70% gate withheld every route.
+answer_confidence = action_data.get("answer_confidence", 0)
+```
+
+```python
+if chosen_action == "auto_reply":
+    print("Action triggered: Invoking Ollama to draft an automatic customer reply...\n")
+elif chosen_action == "escalate_to_human":
+    print("Action triggered: Escalating to a human agent.\n")
+else:
+    print("Action evaluated as 'ignore'. No response generated.")
+```
+
+The holding reply and the two Ollama prompts are unchanged. What changed is which action reaches them. A how-to that wins at 55% now gets the automatic reply. A message whose highest probability is `ignore` is ignored, rather than held for a human because it missed 70%. The nine misses in the matrix above are the ones that still go the wrong way.
+
+## Piling the ten wordings into one option
+
+Joining all ten sentences for an action, and scoring that single trio, got 17 of 50 right. Credited confidence fell to 0.159. Auto-reply was 0 of 17, escalate 9 of 17, ignore 8 of 16.
+
+Laya renders each option as `label: description` and keeps 48 tokens. The joined texts were 152, 161 and 136 tokens. The model saw the original sentence plus the start of the next one. The winning escalate sentence and the winning ignore sentence both sat past the cut, so this run never read them. A longer description is not a richer description once it exceeds that cap.
+
+Ten separate labels per action, summed back into one class afterwards, runs into the same budget from the other direction. All options share a 192-token head. Thirty of them are cut to about four tokens each, so the descriptions go and often the label does too. Eleven or more options also use the `choice:11+` temperature, which this checkpoint clamps and tells you to treat as uncalibrated. I did not spend a run on that shape.
+
+## A second question
+
+The nine misses fall into clusters, so I tried a second 3-way question on the messages the first question had already called `auto_reply`. The idea was to separate "the customer wants steps" from "the sender wants us to buy, rank, partner, or enter a password or card." Seventeen messages took that path. The three solicitations were among them, so the best possible score was 44 of 50.
+
+Both wordings left those three as `auto_reply`. The SEO pitch went to 85% automatic reply. The first wording also moved "How do I turn off marketing emails?" from a correct automatic reply to ignore, and the score fell to 40 of 50. A sharper ignore sentence, naming SEO and password links explicitly, moved five real how-tos to ignore and scored 36 of 50.
+
+A second question that double-checks `ignore` did no better. Seventeen messages, including the four that should not have been ignored. The re-check left all four as ignore, and it moved a gift-card scam and a "win a free phone" mail to `auto_reply`. Accuracy went to 39 of 50.
+
+The errors that survive the first wording are stable. Asking the same three actions again, with a different sentence, does not pull them apart.
+
+## Scoring the mistakes differently
+
+Accuracy treats every miss as equal. In this pipeline they are not. An automatic reply when a human was needed still sends the customer something. Ignoring that same case drops it. Escalating a how-to or a piece of spam costs a person's time.
+
+`rated_score.py` uses this cost. The row is the true class. The column is the action taken.
+
+| True class | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 0 | 1 | 2 |
+| escalate_to_human | 1 | 0 | 3 |
+| ignore | 2 | 1 | 0 |
+
+Lower is better. On the 50 messages the original wording costs 35: seventeen how-tos escalated at 1 each, four non-tickets given an automatic reply at 2 each, and ten non-tickets escalated at 1 each. The tuned wording, taking the highest probability, costs 19. Nine of those points are the three real cases in the ignore column of the second confusion matrix, at 3 each.
+
+The same probabilities can pick the action with the lowest expected cost, treating each probability as the chance that class is the true one. That corrects the three dropped cases. It also escalates ten how-tos and thirteen non-tickets:
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 7 | 10 | 0 |
+| escalate_to_human | 0 | 17 | 0 |
+| ignore | 1 | 13 | 2 |
+
+Accuracy falls to 26 of 50 and the cost rises to 25. Needless escalation costs 1, and these probabilities usually sit between 0.3 and 0.5, so the cheap action wins whenever the model is unsure. The cost matrix is a good way to read a confusion matrix. It is a poor replacement for taking the top probability, at least with this gap between "drop a case" and "ask a human".
+
+One limit on all of these figures: the 50 messages are the set the wording was chosen on. Forty-one out of 50 is the training score. A fresh batch, labelled the same way and not used to pick the sentences, is what would show whether the wording holds.
+
+## The same decision on Jev
+
+Jev is TypeSafe's hosted model for this kind of question. Laya is the open-weight version of the same idea: a state, a `choice` with `criteria`, and probabilities back. `laya-serve` answers `POST /v1/systemone`, which is Jev's endpoint, so a client can aim at either by changing the base URL. I have not sent these 50 messages to Jev. The call below is the documented request, filled in with this demo's instruction and the three winning sentences.
+
+| | Jev | Laya in this demo |
+| --- | --- | --- |
+| Where it runs | TypeSafe's API, `https://api.typesafe.ai/v1/systemone`. The ticket leaves the machine. | `convaiinnovations/laya` on this machine. Apache 2.0. The ticket stays local. |
+| Options in one `choice` | Up to 255. | They share a 192-token head, and each option keeps 48 tokens. Eleven or more land in the bucket this checkpoint treats as uncalibrated. |
+| How much text | About 64k tokens for the request. State plus the longest question can run to 32k. | 512 tokens on the English checkpoint, with about 320 left for the ticket. |
+| One question | Independently measured around 236–276 ms median, including the network. TypeSafe's launch note says 70–500 ms. Neither figure is an SLA. | About 40 ms on a T4 once the weights are loaded. This demo is on CPU, and one pass over the 50 messages takes about 20 seconds. |
+| Price | $0.042 per million input tokens. Output tokens are free. | The compute already on the machine. The coordinate search was about 22 minutes of CPU. |
+| What you can change | The criteria, and which model version you pin. The weights stay closed. | The criteria, and a fine-tune. The demo loads the base English checkpoint. |
+
+On the typed-decisions benchmark (2,000 decisions, four workflows), Jev 1.13.0 is published at 0.727 accuracy, 0.580 soft accuracy, and 0.144 calibration error. The base English Laya checkpoint, the one this demo loads, scores 0.362 on that set, under a majority-class baseline of 0.461. `laya-typed-decisions`, fine-tuned on that benchmark's own training split, scores 0.766. Laya's model card says the Jev column is copied from published results and was not re-measured on the same prompts. The 0.766 is a different checkpoint from `laya_demo.py`.
+
+A wide label set is where those budgets diverge. Banking77 is 77 intents. Jev scores 0.870 on 72 of those labels. Laya scores 0.425 at the default head budget, because each label is left with a few tokens. This router has three labels. The first confusion matrix failed on the sentence, with every how-to sent to a human, and the option count was already small enough to fit.
+
+The Jev call keeps Ollama for the customer email and the handoff note. Jev only picks the action. Pin `jev-1.13.0` rather than `jev-latest` if a threshold has to stay still, because the docs say the moving alias can change behaviour.
+
+```python
+answer = requests.post(
+    "https://api.typesafe.ai/v1/systemone",
+    headers={"Authorization": f"Bearer {os.environ['TYPESAFE_API_KEY']}"},
+    json={
+        "model": "jev-1.13.0",
+        "state": ticket,
+        "questions": {
+            "action": {
+                "type": "choice",
+                "instructions": "What action should be taken for this customer support ticket?",
+                "criteria": {
+                    "auto_reply": "A how-to or FAQ: password reset, Bluetooth pairing, order tracking, firmware, or account settings.",
+                    "escalate_to_human": "Broken hardware, a refund, a safety issue, or an account takeover.",
+                    "ignore": "Not a customer support request.",
+                },
+            }
+        },
+    },
+    timeout=30,
+).json()["answers"]["action"]
+
+chosen_action = answer["choice"]
+```
+
+`choice` is the option with the highest probability, as it is in Laya, and `answer["probabilities"]` is the distribution. The three branches in the demo stay as they are: draft a reply, send the holding reply plus a handoff note, or print nothing.
+
+The confidence field is a different number. Laya's `answer_confidence` is the top probability, and with this wording a correct call sits around 0.51 to 0.58. Jev's `confidence` falls when that probability is spread across the options and rises when one option peaks. A 70% check on one field is a different rule from a 70% check on the other. I would score a labelled batch before choosing a cutoff. That is what pushed the 70% gate out of this demo, once the right answers landed in the 0.5s.
+
+The wording search would also shrink. Joining all ten sentences scored 17 of 50 here because Laya cut each option at 48 tokens and the winning escalate and ignore lines sat past the cut. Jev's documented budget is the 64k request, and one choice holds 255 options, so those sentences would be part of the input. The nine misses were stable across nearby wordings, and a longer rubric can still draw the boundary in the wrong place. The labelled set, the cost matrix, and the confusion matrix are the parts worth keeping. The parts tied to this checkpoint are the short sentence, the three-option limit, and a coordinate search built around an 18-second CPU call. On Jev those 50 messages are one API call each. The open measurement is whether the top probability is right, and whether `confidence` is high on the right rows and low on the nine misses.
+
+## Things to Know
+
+**The option text has a hard length.** Forty-eight tokens per option, and 192 for the whole head at the default settings. I found the winning sentences by keeping each one short, then confirmed the failure mode by joining all ten and watching the winners get truncated. If a description matters, it has to fit in the first 48 tokens, not after them.
+
+**A follow-up question needs a different job.** Both second questions asked for the same three actions in different words. The solicitations still looked like how-tos, and the dropped cases still looked ignorable. The follow-up also only sees the messages the first question already routed that way, so it cannot fix a how-to that was escalated.
+
+**Flat probabilities make a cost rule collapse.** The three dropped cases are exactly the ones a cost-aware rule should save, and it does save them. It saves them by escalating almost every close call. The original wording plus the 70% gate was already a version of that policy: when unsure, send it to a person. The demo now takes the other side. It trusts the top probability of the tuned wording, so a how-to at 0.55 gets an automatic reply, and those three dropped cases stay dropped.
+
+**The `choice:11+` warning still matters.** The first post's three-option question is in the calibrated 3-to-5 bucket. Anything I considered with eleven or more labels is the bucket Laya warns about on startup. I kept every measured run at three options.
+
+## Key Takeaways
+
+- **Test option text the way you test code.** A labelled set of 50 turned "it always escalates" from a hunch into a 0-of-17 count, and showed which sentence moved it.
+- **One short sentence beats a stack of sentences when the model truncates the option.** The text past 48 tokens is not a soft hint. It is absent.
+- **Read the off-diagonal, not just the accuracy.** 41 of 50 hides three dropped cases and three solicitations that received a customer reply. Those are different failures.
+- **A cost matrix is for scoring a confusion matrix.** Using it to pick the action, while probabilities are spread across all three classes, buys the cheap action on every close call.
+- **Don't retune on the same messages you report.** The wording was chosen on these 50. The next measurement needs messages it has not seen.
+- **A confidence gate has to sit where the scores actually land.** 70% matched the old wording, which piled about 0.76 onto escalate. The tuned wording's correct calls sit around 0.5 to 0.6, so the same number blocks the routes it just made possible.
+- **The same question can hide a different confidence field.** Laya's usable number on this 3-option call is the top probability. Jev's `confidence` describes how peaked that distribution is. Copying a 70% cutoff from one field onto the other changes the rule.
+
+## The Code
+
+The demo is [pyardley/laya-ollama-demo](https://github.com/pyardley/laya-ollama-demo), written up in [A Local Decision + Generation Pipeline with Laya and Ollama](/blog/laya-ollama-local-pipeline). `laya_demo.py` now uses the three winning sentences and routes on the highest-probability action. The search that picked them lives next to it:
+
+- `tune_criteria.py` searches the wordings and writes `criteria_search_results.json`
+- `data/customer_messages.json` holds the 50 labelled messages
+- `data/criteria_variants.json` holds the ten sentences per action
+- `second_pass.py` re-asks messages already classified as `auto_reply`
+- `rated_score.py` holds the cost matrix, the expected-cost decision, and the ignore re-check
+
+There is no Jev client in the repo. The request in the Jev section is TypeSafe's documented `POST /v1/systemone` shape, with this demo's instruction and criteria filled in.
