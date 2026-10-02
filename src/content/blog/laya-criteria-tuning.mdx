@@ -1,10 +1,11 @@
 ---
 title: "Tuning Laya's Option Text Against a Labelled Ticket Set"
-description: "A follow-up to the local Laya and Ollama demo. Fifty labelled support messages, ten wordings of each option, confusion matrices, and a cost matrix. The demo now uses the winning sentences and routes on the top probability. A later section sets that same decision next to TypeSafe Jev."
+description: "A follow-up to the local Laya and Ollama demo. Fifty labelled support messages, ten wordings of each option, confusion matrices, and a cost matrix. The demo uses the winning sentences and routes on the top probability. Later sections set that decision next to TypeSafe Jev, then try extra Laya questions, a sum of thirty yes/no scores, and a second set of fifty messages."
 pubDate: 2026-09-29
+updatedDate: 2026-10-02
 author: "Paul Yardley"
 tags: ["AI", "Local LLM", "Python", "AI Agents"]
-readingTime: "17 min read"
+readingTime: "26 min read"
 draft: false
 ---
 
@@ -114,7 +115,7 @@ Joining all ten sentences for an action, and scoring that single trio, got 17 of
 
 Laya renders each option as `label: description` and keeps 48 tokens. The joined texts were 152, 161 and 136 tokens. The model saw the original sentence plus the start of the next one. The winning escalate sentence and the winning ignore sentence both sat past the cut, so this run never read them. A longer description is not a richer description once it exceeds that cap.
 
-Ten separate labels per action, summed back into one class afterwards, runs into the same budget from the other direction. All options share a 192-token head. Thirty of them are cut to about four tokens each, so the descriptions go and often the label does too. Eleven or more options also use the `choice:11+` temperature, which this checkpoint clamps and tells you to treat as uncalibrated. I did not spend a run on that shape.
+Ten separate labels per action, summed back into one class afterwards, runs into the same budget from the other direction. All options share a 192-token head. Thirty of them are cut to about four tokens each, so the descriptions go and often the label does too. Eleven or more options also use the `choice:11+` temperature, which this checkpoint clamps and tells you to treat as uncalibrated. I did not spend a run on that 30-option `choice`. Thirty separate yes/no questions, one sentence each, are a different shape, and that one is below.
 
 ## A second question
 
@@ -150,7 +151,105 @@ The same probabilities can pick the action with the lowest expected cost, treati
 
 Accuracy falls to 26 of 50 and the cost rises to 25. Needless escalation costs 1, and these probabilities usually sit between 0.3 and 0.5, so the cheap action wins whenever the model is unsure. The cost matrix is a good way to read a confusion matrix. It is a poor replacement for taking the top probability, at least with this gap between "drop a case" and "ask a human".
 
-One limit on all of these figures: the 50 messages are the set the wording was chosen on. Forty-one out of 50 is the training score. A fresh batch, labelled the same way and not used to pick the sentences, is what would show whether the wording holds.
+One limit on all of these figures: the 50 messages are the set the wording was chosen on. Forty-one out of 50, and cost 19, are the training score of `a1` / `e3` / `i9`. The next two sections stay on that set. A second batch of 50, not used to pick a sentence, is scored after that.
+
+## Combining a second decision
+
+I reloaded `convaiinnovations/laya` 0.3.20 and asked the tuned three-way question again. Every choice and every probability matched the search file. Cost 19, 41 of 50, reproduced rather than assumed. Asking that same question a second time produced the same choice and the same probabilities on all 50 messages. A majority over two samples has nothing to vote on. It still costs 19, and it spends two calls per message.
+
+The second questions from earlier in this post asked for the same three actions in different words. This pass asks two questions that are not a copy of the route. The strings are in `experiments/questions.py`.
+
+```python
+"instruction": "Who is writing, relative to this shop?",
+"criteria": {
+    "customer": "A person writing about their own order, account, or device.",
+    "outsider": "Spam, a pitch, recruitment, or someone else's notice.",
+    "unclear": "Not enough to tell whether the sender is a customer.",
+}
+```
+
+```python
+"instruction": "What kind of help does the sender need?",
+"criteria": {
+    "steps": "Steps, or the wording of a published policy. Nothing has failed.",
+    "staff": "A fault, a refund, a cancellation, a replacement, or an unsafe account.",
+    "none": "No help with their own order, account, or device.",
+}
+```
+
+`need` answered `none` on all 50 messages. A fixed map that ignores anyone `need` calls `none` therefore ignores every ticket. Cost 85. Accuracy 16 of 50, which is just the 16 non-tickets.
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 0 | 0 | 17 |
+| escalate_to_human | 0 | 0 | 17 |
+| ignore | 0 | 0 | 16 |
+
+A vote of the demo choice plus those two specialists does better than that and still loses. Because `need` is `none` everywhere, ignore starts with a vote on every message. Cost 45, 30 of 50. Ten how-tos the demo got right flip to ignore.
+
+Using the specialists only to repair the expensive mistakes, with no confidence gate, also loses. `need` never says `staff`, so a dropped case is never pulled back to a human. Ownership says `outsider` often enough, including on real how-tos, that ten correct automatic replies become ignores. Cost 37, 32 of 50.
+
+Fitting a threshold on the same 50 changes one message. The grid is 0.00 to 1.00 in steps of 0.05. The fit is `t_own = 0.60` and `t_need = 1.01`. `t_need` cannot matter, because `need` never varies, and the tie-break then picks the highest threshold. Reapplied, `m37` moves. It is a real non-ticket. The demo called it `auto_reply` at 0.4765, and ownership called it `outsider` at 0.6454, which clears 0.60. That miss cost 2 and now costs 0. Frozen cost 17, 42 of 50. Leave one message out and refit: forty-nine folds still choose 0.60, and the fold that holds out `m37` chooses a threshold that never fires. Leave-one-out cost is 19. Leave-one-out accuracy is 41 of 50. The two-point saving exists only when the threshold is allowed to see `m37`.
+
+The 70% gate, recomputed on these same probabilities, costs 33 and gets 17 of 50. Every message is escalated. The one score that clears 70% is `m26`, already an escalation at 0.8525, so the gate never opens another route.
+
+Among these `choice` rules, the cost I can claim on the development set is still **19**, from one call, the tuned wording, and the highest probability.
+
+## Thirty yes/no scores
+
+Each of the thirty sentences can also be its own `noul` question: "Does this description match the customer message?" The true option is that sentence. The false option, on every question, is "This description does not match the customer message." A cell is the probability that the sentence matches. The thirty cells do not compete, and a row does not sum to 1. Scoring the matrix is 1,500 questions, 30 per message. On this CPU the short wording took 466.6 seconds and the longer wording took 478.4.
+
+Two rules read that matrix. The highest cell wins, and its group is the action (`a` is automatic, `e` is escalate, `i` is ignore). Or sum the ten scores in each group and take the largest total.
+
+On the short sentences, the original one-line wordings:
+
+| Rule | Cost | Accuracy |
+| --- | ---: | --- |
+| Highest cell | 19 | 40/50 |
+| Sum of each group | 10 | 44/50 |
+
+The highest cell ties the tuned `choice` on cost and is one message worse on accuracy. Five how-tos are ignored. On `m04`, "How do I change the email address on my account?", the top cell is `i1` at 0.7935, an ignore sentence about spam and phishing. `a1`, the winning how-to sentence, is 0.2164 on that row.
+
+The group sum is the lowest cost I have measured on these 50. Every real case is an escalation. The six misses are five how-tos and one non-ticket. It is thirty yes/no questions per message, not one 3-option call, and the columns were not trained as a three-way decision. The sentences were written for this set. Cost 10 is a training score, the same kind of figure as cost 19.
+
+A `noul` true option is still cut at 48 tokens. It is rendered as `true: ` plus the sentence, and that prefix is 3 tokens, so the sentence itself can use about 45. A `choice` option spends more of the same 48 on the action label. `escalate_to_human:` is 8 tokens. I rewrote each of the thirty sentences to fill the `noul` budget and kept the short line as `backup`. The same two rules on the longer text:
+
+| Rule | Cost | Accuracy |
+| --- | ---: | --- |
+| Highest cell | 74 | 19/50 |
+| Sum of each group | 33 | 33/50 |
+
+An ignore sentence wins 14 of the 17 how-tos and 14 of the 17 real cases under the highest-cell rule. Filling the spare tokens made both rules worse. The short lines are the ones that scored 10.
+
+## A second set of 50
+
+`data/heldout_messages.json` is a new batch, written after the wording and the thresholds were frozen. Seventeen how-tos, seventeen real cases, sixteen non-tickets. None of the sentences are copied from the first file. The labelling rule is the same. The file was not used to pick a sentence.
+
+The rule I ran is the short-wording group sum. `experiments/heldout_group_sum.py` reads the `backup` sentences, asks the same yes/no question, and refuses the original 50. 1,500 scores, 366.6 seconds. No group totals tied.
+
+Cost **16**. Accuracy 40 of 50. The development cost of 10 did not hold. One real case was ignored, `h28`, a subscription the website would not cancel, at cost 3. Four how-tos moved. Five non-tickets were answered.
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 13 | 2 | 2 |
+| escalate_to_human | 0 | 16 | 1 |
+| ignore | 2 | 3 | 11 |
+
+Two of the non-ticket misses are three totals within a few thousandths of each other. `h37`, a fake warranty renewal that asks for a card, has automatic 5.0025, escalate 5.0013, ignore 4.9987, so the automatic total wins. `h49`, a password-phishing link, is the same kind of three-way near tie, and escalate wins. The rule still takes the highest total. Both are wrong.
+
+The tuned three-way `choice`, the rule in `laya_demo.py`, has now been run on this second file. `experiments/apply.py` asks only that question, one call per message, and does not refit a threshold. Loading took 13.1 seconds. The pass took 21.6 seconds. The options were inside the 48-token cap.
+
+Cost **37**. Accuracy 32 of 50. On the first 50 this question costs 19 and gets 41 right. On this file the short-wording group sum costs 16 and gets 40 right, from thirty yes/no questions rather than one call.
+
+| Actual | auto_reply | escalate_to_human | ignore |
+| --- | ---: | ---: | ---: |
+| auto_reply | 12 | 1 | 4 |
+| escalate_to_human | 1 | 10 | 6 |
+| ignore | 3 | 3 | 10 |
+
+Eighteen messages go the wrong way. Six of them are real cases ignored, at 3 each, and those 18 points are about half the cost. They are a scratched speaker left in a bin, a protection plan that was never selected, a speaker that fell into a bath while plugged in, an account with a new overseas address and a pending order, a subscription the website would not cancel, and a trading-standards letter about the battery claim. The subscription, `h28`, is ignore at 0.7635. The group sum ignored it as well. The escalate sentence names broken hardware, a refund, a safety issue, or an account takeover, and the bath and the overseas order are in that list and still lose.
+
+Four how-tos are ignored, one how-to is escalated, and one short-delivery complaint is given an automatic reply. Three non-tickets get an automatic reply: a bulk offer for broken speakers, a podcast sponsorship, and a prize that asks for a bank card. The prize is `auto_reply` at 0.6357. Three other non-tickets are escalated, including the fake warranty renewal and the password-phishing link.
 
 ## The same decision on Jev
 
@@ -210,7 +309,13 @@ The wording search would also shrink. Joining all ten sentences scored 17 of 50 
 
 **Flat probabilities make a cost rule collapse.** The three dropped cases are exactly the ones a cost-aware rule should save, and it does save them. It saves them by escalating almost every close call. The original wording plus the 70% gate was already a version of that policy: when unsure, send it to a person. The demo now takes the other side. It trusts the top probability of the tuned wording, so a how-to at 0.55 gets an automatic reply, and those three dropped cases stay dropped.
 
-**The `choice:11+` warning still matters.** The first post's three-option question is in the calibrated 3-to-5 bucket. Anything I considered with eleven or more labels is the bucket Laya warns about on startup. I kept every measured run at three options.
+**The `choice:11+` warning still matters.** The first post's three-option question is in the calibrated 3-to-5 bucket. Anything I considered with eleven or more labels is the bucket Laya warns about on startup. I kept every measured `choice` at three options. The thirty-sentence run is thirty separate `noul` questions, two options each, not one 30-way choice.
+
+**A second question can fail by never varying.** `need` answered `none` on all 50 development messages, so every rule that trusted it ignored tickets or started ignore with a vote. A different job on paper is not a different job in the scores.
+
+**Filling the token budget is a different change from finding a better sentence.** The longer `noul` lines use the spare tokens past the short wording. Highest-cell cost went from 19 to 74, and the group sum went from 10 to 33.
+
+**A threshold fit on the reported set can be one message.** `t_own = 0.60` saves `m37` and nothing else. Leave that message out of the fit and the saving disappears. The number I keep is the leave-one-out cost, 19, not the reapplied cost, 17.
 
 ## Key Takeaways
 
@@ -218,7 +323,8 @@ The wording search would also shrink. Joining all ten sentences scored 17 of 50 
 - **One short sentence beats a stack of sentences when the model truncates the option.** The text past 48 tokens is not a soft hint. It is absent.
 - **Read the off-diagonal, not just the accuracy.** 41 of 50 hides three dropped cases and three solicitations that received a customer reply. Those are different failures.
 - **A cost matrix is for scoring a confusion matrix.** Using it to pick the action, while probabilities are spread across all three classes, buys the cheap action on every close call.
-- **Don't retune on the same messages you report.** The wording was chosen on these 50. The next measurement needs messages it has not seen.
+- **Don't retune on the same messages you report.** The wording was chosen on the first 50. Cost 19 is that training score. On a second 50 the same three-way question costs 37 and gets 32 of 50. The group-sum rule, which cost 10 on the first file, costs 16 on the second.
+- **Repeating the same prompt does not make a vote.** Two calls of the tuned question matched on every message. The extra call buys nothing.
 - **A confidence gate has to sit where the scores actually land.** 70% matched the old wording, which piled about 0.76 onto escalate. The tuned wording's correct calls sit around 0.5 to 0.6, so the same number blocks the routes it just made possible.
 - **The same question can hide a different confidence field.** Laya's usable number on this 3-option call is the top probability. Jev's `confidence` describes how peaked that distribution is. Copying a 70% cutoff from one field onto the other changes the rule.
 
@@ -231,5 +337,11 @@ The demo is [pyardley/laya-ollama-demo](https://github.com/pyardley/laya-ollama-
 - `data/criteria_variants.json` holds the ten sentences per action
 - `second_pass.py` re-asks messages already classified as `auto_reply`
 - `rated_score.py` holds the cost matrix, the expected-cost decision, and the ignore re-check
+- `experiments/EXPERIMENTS.md` is the log of the combined-decision runs and the `noul` sums
+- `experiments/run_all.py` scores the `choice` rules on the original 50 and refuses any other file
+- `experiments/questions.py` holds the demo question plus `ownership` and `need`
+- `noul_matrix.py` scores every wording as a yes/no against every development message
+- `experiments/heldout_group_sum.py` runs the short-wording group sum on a new file
+- `data/heldout_messages.json` is the second set of 50
 
 There is no Jev client in the repo. The request in the Jev section is TypeSafe's documented `POST /v1/systemone` shape, with this demo's instruction and criteria filled in.
