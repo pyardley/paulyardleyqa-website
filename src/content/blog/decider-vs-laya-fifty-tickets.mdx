@@ -1,0 +1,135 @@
+---
+title: "Decider and Laya on the same fifty tickets"
+description: "The fifty labelled support messages from the Laya wording search, asked again of Decider 0.8B and Decider 2B with the winning three sentences. Both score 43 of 50. Laya scored 41. A message takes about a second on the 0.8B and about two on the 2B."
+pubDate: 2026-10-05
+author: "Paul Yardley"
+tags: ["AI", "Local LLM", "Python", "AI Agents"]
+readingTime: "8 min read"
+draft: false
+---
+
+The [Laya wording search](/blog/laya-criteria-tuning) settled on three sentences and a highest-probability choice. On the 50 labelled messages that search used, Laya gets 41 right. I asked [Decider 0.8B](https://huggingface.co/Mapika/decider-0.8b) and [Decider 2B](https://huggingface.co/Mapika/decider-2b) the same question, with those same three sentences, and compared each choice with the label and with Laya.
+
+The sentences are unchanged:
+
+```python
+"auto_reply": "A how-to or FAQ: password reset, Bluetooth pairing, order tracking, firmware, or account settings.",
+"escalate_to_human": "Broken hardware, a refund, a safety issue, or an account takeover.",
+"ignore": "Not a customer support request."
+```
+
+Both Decider models get 43 of 50 right. They do not get the same 43.
+
+## Laya
+
+Rows are the true label. Columns are the action the model chose. The diagonal is the messages it got right. This is the saved run from the wording post, 41 of 50.
+
+| Actual            | auto_reply | escalate_to_human | ignore |
+| ----------------- | ---------: | ----------------: | -----: |
+| auto_reply        |         14 |                 2 |      1 |
+| escalate_to_human |          0 |                14 |      3 |
+| ignore            |          3 |                 0 |     13 |
+
+## Decider 0.8B
+
+Same 50 messages.
+
+| Actual            | auto_reply | escalate_to_human | ignore |
+| ----------------- | ---------: | ----------------: | -----: |
+| auto_reply        |         16 |                 0 |      1 |
+| escalate_to_human |          0 |                17 |      0 |
+| ignore            |          4 |                 2 |     10 |
+
+43 of 50 are right. Every real escalation is sent to a human. Sixteen of the 17 how-tos get an automatic reply. The ignore row is the weak one: 10 of 16, with four non-tickets given an automatic reply and two sent to a human. It matches Laya's choice on 41 of the 50.
+
+## Decider 2B
+
+| Actual            | auto_reply | escalate_to_human | ignore |
+| ----------------- | ---------: | ----------------: | -----: |
+| auto_reply        |         14 |                 2 |      1 |
+| escalate_to_human |          0 |                17 |      0 |
+| ignore            |          3 |                 1 |     12 |
+
+Also 43 of 50. The escalate row is clean, the same 17 of 17. The how-to row is back to Laya's 14 of 17, and the ignore row is 12 of 16, one short of Laya. It matches Laya's choice on 39 of the 50, so it is a little further from Laya than the 0.8B is, at the same score against the labels.
+
+## How long a decision took
+
+Both checkpoints were already on disk, on CPU, in float32. Loading the 0.8B took 3.8 seconds. Loading the 2B took 9.1 seconds. After that, each message is one call.
+
+|                  | Decider 0.8B | Decider 2B |
+| ---------------- | -----------: | ---------: |
+| Load             |        3.8 s |      9.1 s |
+| Mean per message |       0.93 s |      2.0 s |
+| Fastest message  |       0.86 s |     1.78 s |
+| Slowest message  |       1.13 s |     3.05 s |
+| All 50 messages  |       46.3 s |     99.8 s |
+
+The 2B takes a little more than twice as long per message, for the same 43 of 50. Fifty messages are 46 seconds on the 0.8B and 100 seconds on the 2B. Both models together, loads included, finished in 2 minutes 55 seconds.
+
+The slow calls are the first few. After those, the 0.8B stays between 0.86 and 1.00 seconds, and the 2B stays between 1.78 and 2.24 seconds. Every message is short, 91 to 115 input tokens, and the longer ones are among the faster calls. The 2B's slowest call is the angry tracking question, at 3.05 seconds, and that is the second message in the file.
+
+These times are the Decider passes. Laya's 41 is the saved wording-search result, so this file does not time Laya.
+
+## What all three got wrong
+
+Two messages are wrong for Laya, the 0.8B, and the 2B.
+
+**The SEO pitch.** "We offer SEO and backlink packages that will rank your site on Google. Reply YES for a proposal." The label is `ignore`. All three choose `auto_reply`. The 0.8B puts 77% on that, the 2B puts 65%. Nothing in the how-to sentence is about selling SEO. The pitch still reads to all three as something that can be answered automatically.
+
+**The phishing mail.** "Urgent: verify your mailbox password at http://secure-login-reset.example within 24 hours or the account will be closed." The label is `ignore`. Laya and the 0.8B choose `auto_reply`. The how-to sentence names a password reset, and this mail uses those words. The 2B does not copy that mistake. It chooses `escalate_to_human` at 58%, with 40% still on `auto_reply` and 2% on `ignore`. A human would receive the phishing mail instead of an automatic reply. The label is still missed.
+
+## Where both Deciders beat Laya
+
+Laya's three dropped cases, the real tickets it called `ignore`, are all escalations for both Decider models, and each call is above 87%.
+
+- **Account takeover.** "Someone changed my password and placed an order I didn't make. Please lock the account." The escalate sentence names an account takeover. Laya still ignores it. The 0.8B puts 97% on `escalate_to_human`, the 2B puts 97%.
+- **The hissing speaker.** "There is a constant hiss even with no music playing. I already tried a different source and cable." Laya ignores it. The 0.8B escalates at 95%, the 2B at 88%.
+- **Cancel and refund.** "Please cancel order 88210 and refund me. It has not shipped, and the website will not let me cancel it." The escalate sentence names a refund. Laya ignores it. Both Deciders escalate, at 93% and 97%.
+
+That is the whole of Laya's escalate row going from 14 to 17. Neither Decider model drops a real case on this set.
+
+Both also fix one of Laya's two frustrated how-tos. "What hours is customer support open?" is an `auto_reply` for the 0.8B at 76% and for the 2B at 90%. Laya had sent it to a human.
+
+## Where one model does better
+
+**The 0.8B is the only one that keeps the angry tracking question as a how-to.** "This is ridiculous, where is the tracking number on the website? I can't find the page." The label is `auto_reply`. Laya and the 2B both escalate. The 0.8B chooses `auto_reply` at 43%, with escalate at 43%. It is the right side of a tie, not a confident call. That is why its how-to row is 16 rather than 14.
+
+**The 2B is the only one that keeps the returns-policy question as a how-to.** "What is your returns window? I'm not sending anything back, I just want the policy." Laya and the 0.8B ignore it. The refusal in the sentence still outweighs the question for them. The 2B chooses `auto_reply` at 78%.
+
+**The 2B is the only one that ignores the company buying returns.** "We purchase customer returns and used electronics in bulk. Are you selling your surplus stock?" Laya treats it as a how-to, which is the third non-ticket in Laya's `auto_reply` column. The 0.8B sends it to a human. The 2B chooses `ignore` at 85%.
+
+The other gains are paid for on messages Laya already had right.
+
+The 0.8B gives an automatic reply to a dentist reminder ("Reply STOP to opt out") at 76%, and to an out-of-office autoreply at 90%. It escalates a customs-fee mail ("Pay the release fee at the link below") at 77%. Laya and the 2B ignore the dentist reminder and the customs mail. The out-of-office note fools both Deciders: the 2B puts 93% on `auto_reply` as well. Laya ignores it.
+
+The 2B ignores "How do I turn off marketing emails?" at 55%, and it escalates "How do I turn off the volume limit in the app? Playback is quieter than I expected." That second one is 50% escalate against 44% auto-reply. Laya and the 0.8B treat both as how-tos. The 2B also gives an automatic reply to a factory sales letter ("our Shenzhen factory can supply Bluetooth speakers... Minimum order 500 units") at 52%. Laya and the 0.8B ignore it.
+
+## What the two scores are saying
+
+43 and 43 are the same headline and a different set of mistakes. The 0.8B's seven misses are the returns-policy how-to, the SEO pitch, the phishing mail, the dentist reminder, the returns buyer, the customs-fee mail, and the out-of-office note. The 2B's seven are the angry tracking question, marketing emails, the volume limit, the SEO pitch, the phishing mail, the factory letter, and the out-of-office note. Only the SEO pitch, the phishing mail, and the out-of-office note are shared between the two Deciders, and only the first two of those are shared with Laya.
+
+The escalate row is the clear gain. Laya dropped three real tickets. Neither Decider model drops one here. The cost of that gain shows up in the ignore row, where both Deciders are worse than Laya's 13 of 16: the 0.8B gets 10, the 2B gets 12. The 0.8B spends the difference on how-tos, 16 of 17 against the 2B's 14. The 2B spends it on keeping more non-tickets out.
+
+## Key Takeaways
+
+- **The same accuracy can be a different confusion matrix.** Both Decider models score 43 of 50. One is better at how-tos. The other is better at ignoring mail that is not a customer.
+- **Twice the wait buys the same headline score.** On this laptop a message is about a second on the 0.8B and about two seconds on the 2B. Fifty messages are 46 seconds and 100 seconds. The difference that shows up in the labels is which seven each model misses.
+- **Read the row that changed, not only the total.** Laya's escalate row was 14 because three real tickets were ignored. Both Deciders make that row 17. Their extra errors are on messages that should have been ignored, or on how-tos the other model still gets.
+- **A shared miss is a property of the question, not of one model.** The SEO pitch is `auto_reply` for Laya and for both Deciders. The phishing mail never lands on `ignore` either. Changing the checkpoint does not move those two.
+- **A close call is not the same result as a peaked one.** The 0.8B's correct call on the angry tracking question is 43% against 43%. The account-takeover calls are 97%. Those belong in different sentences when you talk about what the model is sure of.
+- **Compare the choices, not a second run of the first model.** Laya's 41 comes from the saved wording-search result. The Decider numbers are a new pass over the same 50 texts and the same three sentences.
+
+## The Code
+
+Laya's messages, labels, and saved choices are in [pyardley/laya-ollama-demo](https://github.com/pyardley/laya-ollama-demo), written up in [Tuning Laya's Option Text Against a Labelled Ticket Set](/blog/laya-criteria-tuning):
+
+- `data/customer_messages.json` holds the 50 labelled messages
+- `experiments/results/baseline_argmax.json` is Laya's choices with the winning wording, 41 of 50
+
+The Decider run is in [pyardley/DeciderDemo](https://github.com/pyardley/DeciderDemo):
+
+- `Compare-Laya.ps1` scores the catalog models you name
+- `bench/compare_laya.py` asks the three-way question and writes one JSON object per line
+- The file for this post is `results/laya-compare-20261005-135949.jsonl`, which is gitignored
+
+That run scored Decider 0.8B and Decider 2B. It did not include Decider 4B.
