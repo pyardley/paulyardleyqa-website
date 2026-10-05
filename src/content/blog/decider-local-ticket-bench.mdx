@@ -1,0 +1,233 @@
+---
+title: "A local bench of Decider 0.8B, 2B, and 4B on three support tickets"
+description: "The same three support tickets, asked of Decider 0.8B, 2B, and 4B · v2 on a 16 GB Windows laptop. The calls agree on team and refund. They split on how urgent a lockout is. On CPU, the two float32 models finish in seconds and the bf16 4B checkpoint takes minutes."
+pubDate: 2026-10-05
+author: "Paul Yardley"
+tags: ["AI", "Local LLM", "Python", "AI Agents"]
+readingTime: "8 min read"
+draft: false
+---
+
+The [local Laya and Ollama pipeline](/blog/laya-ollama-local-pipeline) uses a small decision model for the routing and a generative model only when someone needs a written reply. [Decider](https://huggingface.co/Mapika) is the same kind of model: one pass, typed questions, a probability for every option you defined. It does not write the reply, and its weights are not in the Ollama library.
+
+I wanted the three published sizes on the same tickets, on the laptop I actually have. The bench loads each checkpoint in its own process, asks the three questions the demo page asks, and appends one JSON object per line. This post is that run: `results/bench-20261005-114844.jsonl`, started at 10:48 UTC on 5 October 2026, finished at 10:58. The code is on GitHub at [pyardley/DeciderDemo](https://github.com/pyardley/DeciderDemo).
+
+## What Decider is
+
+Decider, from Mapika, follows the same wire format as TypeSafe Jev. You pass a state (here, a ticket and a short refund policy) and a set of questions. Question types in this demo are `choice` (pick one named option), `noul` (a yes probability), and `score` (an expected position on a rubric). The call is `Decider.system_one(state, questions)`. `usage.output_tokens` is 0. The token counts below are input tokens, and they are identical for every model, because the prompt does not change with the checkpoint.
+
+The demo starts on **Decider 4B · v2**, the checkpoint [Jev Arena](https://github.com/theaiautomators/jev-arena) evaluates under that name: `Mapika/decider-4b` at `49564ddcfccafb6db563eb757c1d41e6c78dcb56`. The other two entries are current Hub mains: [Decider 2B](https://huggingface.co/Mapika/decider-2b) (`decider-2b-v11`) and [Decider 0.8B](https://huggingface.co/Mapika/decider-0.8b) (`decider-0.8b-v1`). This run used `decider-ai` 1.8.1.
+
+There is no gold label. The file records choices, probabilities, tokens, timings, and memory. It is a measurement of agreement and cost on three hand-written tickets, not an accuracy benchmark. The publishers' millisecond times are from an NVIDIA B300. They are a different machine.
+
+## Setup
+
+Windows, PowerShell, and [uv](https://docs.astral.sh/uv/) on `PATH`. The laptop in this file is Windows 11, Intel64 Family 6 Model 165, Python 3.12.12, with 8,255 MB free when the run started. The install is the CPU build of PyTorch. A 4 GB GPU cannot hold the 4B or 2B weights, so every model here runs on CPU.
+
+```powershell
+git clone https://github.com/pyardley/DeciderDemo.git
+cd DeciderDemo
+.\Start-Demo.ps1
+```
+
+`Start-Demo.ps1` creates `.venv` on Python 3.12, installs CPU PyTorch and `decider-ai[serve]`, downloads whichever checkpoint `demo/models.json` marks active, and serves the page at http://127.0.0.1:8787. Stop that window before the bench. The bench loads the weights itself, and the demo would still be holding the active checkpoint.
+
+The catalog pins repo, revision, folder, device, and dtype. The 0.8B entry is the same shape as the other two:
+
+```json
+"0.8b": {
+  "name": "Decider 0.8B",
+  "repo": "Mapika/decider-0.8b",
+  "revision": "a0a01d6f8135298f400a8c856b355793012ae971",
+  "directory": "decider-0.8b",
+  "device": "cpu",
+  "dtype": "float32"
+}
+```
+
+Float32 is the library's fast CPU dtype. The 0.8B and 2B entries use it. The 4B float32 copy is about 17 GB, which does not fit in 16 GB, so that entry stays in bf16. The weight files are about 1.4 GB, 3.8 GB, and 8.4 GB.
+
+## The three questions
+
+The policy and the questions are the ones on the demo page. The policy is one sentence: duplicate charges are refundable, delivery delays are not, and login lockouts go to account access rather than billing.
+
+```python
+QUESTIONS = {
+    "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+            "billing": "Charges, invoices, refunds and duplicate payments",
+            "technical": "Bugs, crashes and outages",
+            "account": "Login, lockouts and access",
+        },
+    },
+    "refund": {
+        "type": "noul",
+        "instructions": "Is the customer asking for a refund?",
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How urgently does a person need to step in?",
+        "criteria": ["can wait", "reply today", "drop everything"],
+    },
+}
+```
+
+The three tickets:
+
+| Id | Ticket |
+| --- | --- |
+| `duplicate` | Charged twice for order A-104. Wants the duplicate back before rent is due. |
+| `crash` | The iOS app crashes on PDF attachments after yesterday's update. Android still works. "I do not need a refund." |
+| `lockout` | Account locked after too many attempts, meeting in an hour, needs the shared drive. "Please do not refund anything." |
+
+## Run the benchmark
+
+Stop the demo first, and close other large programs. From the project folder:
+
+```powershell
+.\Run-Bench.ps1
+.\Run-Bench.ps1 -Models 0.8b,2b
+```
+
+That scores the three tickets on each catalog model, smallest first, one model per process. A missing checkpoint is downloaded from its pinned revision before that model loads. This run used one pass per ticket. Ctrl+C keeps every row already written. The file is `results/bench-<timestamp>.jsonl`, one JSON object per line.
+
+## The run
+
+The 0.8B and 4B weights were already on disk. The 2B file was not, so this run downloaded `Mapika/decider-2b` at the pinned revision in 32.9 seconds, then loaded it. Wall clock for the whole file was 10 minutes 14 seconds.
+
+Load, memory, and the temperature the checkpoint shipped with:
+
+| | Decider 0.8B | Decider 2B | Decider 4B · v2 |
+| --- | ---: | ---: | ---: |
+| Runtime name | `decider-0.8b-v1` | `decider-2b-v11` | `decider-4b-v2` |
+| Dtype | float32 | float32 | bfloat16 |
+| Temperature | 1.03 | 1.145 | 1.935 |
+| Load | 3.5 s | 7.4 s | 11.9 s |
+| Private bytes | 4,418 MB | 10,401 MB | 8,870 MB |
+| Working set | 3,351 MB | 7,694 MB | 8,493 MB |
+| Free RAM after load | 4,918 MB | 635 MB | 717 MB |
+
+The 2B checkpoint also reports a temperature per question type: choice 1.164, noul 1.624, score 1.124. The other two report a single temperature.
+
+Input tokens were 268, 265, and 270 for duplicate, crash, and lockout. Output tokens were 0 on every row.
+
+### Where the three calls agree
+
+Team and refund label agreed on every ticket. Urgency agreed on the first two.
+
+| Ticket | Decider 0.8B | Decider 2B | Decider 4B · v2 |
+| --- | --- | --- | --- |
+| Duplicate charge | billing, yes, reply today | billing, yes, reply today | billing, yes, reply today |
+| App crash | technical, no, reply today | technical, no, reply today | technical, no, reply today |
+| Locked out | account, no, reply today | account, no, reply today | account, no, drop everything |
+
+Department probabilities were high for every model. The lowest team call in the file is 0.8B on the crash, at 94.0% technical. 4B's lockout team call is 99.5% account.
+
+The refund *label* agrees. The yes probability does not:
+
+| Ticket | Decider 0.8B | Decider 2B | Decider 4B · v2 |
+| --- | ---: | ---: | ---: |
+| Duplicate charge | 99.7% | 95.7% | 99.6% |
+| App crash | 14.4% | 26.2% | 0.3% |
+| Locked out | 7.7% | 22.1% | 1.4% |
+
+The crash ticket says "I do not need a refund." The lockout says "Please do not refund anything." All three models stay under 0.5, so the bench records `no`. 2B still puts about a quarter of its mass on yes for the crash, and about a fifth for the lockout. 4B puts well under 2% on both.
+
+### The one split
+
+The lockout is the only ticket where the named urgency level differs. The score is the expected level index (0 = can wait, 1 = reply today, 2 = drop everything). The named level is whichever probability is largest.
+
+| | Decider 0.8B | Decider 2B | Decider 4B · v2 |
+| --- | ---: | ---: | ---: |
+| Can wait | 1.8% | 5.4% | 1.2% |
+| Reply today | 96.6% | 74.0% | 33.7% |
+| Drop everything | 1.6% | 20.6% | 65.2% |
+| Score | 1.00 | 1.15 | 1.64 |
+| Named level | reply today | reply today | drop everything |
+
+The ticket says the customer has a meeting in an hour and needs the shared drive. 0.8B is almost sure that can wait until a normal reply. 2B keeps reply today on top and moves 21% onto drop everything. 4B flips: drop everything at 65.2%, reply today at 33.7%, expected index 1.64. I don't have a labelled set here, so this is a disagreement, not a win for the larger model.
+
+4B's summary for that ticket, as stored:
+
+```json
+{
+  "department": {
+    "choice": "account",
+    "confidence": 0.9924,
+    "probabilities": { "billing": 0.0033, "technical": 0.0018, "account": 0.9949 }
+  },
+  "refund": { "yes": 0.0141, "choice": "no" },
+  "urgency": {
+    "score": 1.64,
+    "level": "drop everything",
+    "probabilities": {
+      "can wait": 0.012,
+      "reply today": 0.3365,
+      "drop everything": 0.6515
+    }
+  }
+}
+```
+
+`confidence` on the department row is 0.9924. The probability of `account` is 0.9949. Those are different numbers. The next section says which one to read.
+
+## Performance
+
+Request time is `system_one` only. Loading is the row above. One repeat, so read these as a single pass on this machine.
+
+| Ticket | Decider 0.8B | Decider 2B | Decider 4B · v2 |
+| --- | ---: | ---: | ---: |
+| Duplicate charge | 4.3 s | 8.8 s | 151.6 s |
+| App crash | 4.0 s | 8.7 s | 138.7 s |
+| Locked out | 5.9 s | 12.1 s | 199.3 s |
+
+Mean request time is 4.7 s, 9.9 s, and 163 s. The 2B is about twice the 0.8B. The 4B is about 17 times the 2B and about 35 times the 0.8B, on the same three prompts.
+
+What the memory columns add:
+
+- **The 4B process was the one that fit in RAM most cleanly, and it was the slow one.** After load, private bytes were 8,870 MB and the working set was 8,493 MB, so most of that process was resident. Free RAM was 717 MB. The three tickets still took 2 minutes 32 seconds, 2 minutes 19 seconds, and 3 minutes 19 seconds.
+- **The 2B process was larger than the 4B process.** Float32 on the 3.8 GB file came out at 10,401 MB private, with 635 MB free and a working set of 7,694 MB. It still answered in 9 to 12 seconds.
+- **The 0.8B process left the machine usable.** 4,418 MB private, 4.9 GB still free, 4 to 6 seconds a ticket.
+- **Load is small next to a 4B ticket.** 3.5 s, 7.4 s, and 11.9 s. A long-running demo pays that once. On this CPU the 4B per-ticket cost does not shrink to the load time.
+
+The dtype is the split that matches the times. The two float32 models are seconds. The bf16 4B model is minutes, while using less memory than the 2B.
+
+**This laptop's GPU could not run the bench.** The card is a 4 GB GeForce GTX 1650 Ti, compute capability 7.5. The 2B process was 10.4 GB and the 4B process was 8.9 GB, so neither checkpoint fits. Decider's CUDA default is bfloat16, and those kernels need compute capability 8.0 or newer, so the 4B dtype is ruled out on this card before the file size comes into it. The 0.8B weights do fit in float16, about 1.5 GB. I loaded that copy. The tickets still took a few seconds, the same range as the CPU float32 times above, because the fast conv and linear-attention kernels were not available for this GPU. That trial is not in the results file, and the environment was put back on the CPU build of PyTorch.
+
+**An ideal GPU is a different machine.** The publishers time these models on an NVIDIA B300. With CUDA graphs the 2B is about 4 ms and the 4B is 5.2 ms, and the 4B without graphs is about 35 ms. Set next to this file's means of 9.9 s and 163 s, that is about 2,500 times quicker for the 2B and about 30,000 times quicker for the 4B, or about 5,000 times against the 35 ms figure. The 0.8B card does not publish a millisecond time. On its regression run it was about 1.5 times faster than the 2B, so the same sort of GPU would take the 4.7 s CPU mean down to a few milliseconds, on the order of a thousand times.
+
+## Things to know
+
+**`confidence` is not the probability of the chosen option.** For a choice question, `decider-ai` 1.8.1 stores TypeSafe's rescaled confidence: `(n * p_max - 1) / (n - 1)`. A uniform spread is 0. All of the mass on one option is 1. With three teams that is `(3 * p_max - 1) / 2`. On the 0.8B crash, technical is 0.9403, and `(3 * 0.9403 - 1) / 2` is 0.9104, which is the `confidence` in the file. The probabilities are the numbers to threshold on. A yes/no question doesn't have this field: `refund.yes` is the model's yes probability, and the bench calls it yes at 0.5.
+
+**The urgency score is an expected index. The named level is the largest probability.** The first version of the demo page used `score` as if it were a level index. A score of 1.15 is "a bit past reply today," not "level 1" and not "round to 2." The bench keeps both. On the 4B lockout, score 1.64 and level "drop everything" are the same answer looked at two ways: the expected index, and the option with 65.2% of the mass.
+
+**The results file is JSON Lines.** Fourteen lines in this file: a `run` header, then for each model a `model` row and three `decision` rows, then `done`. Each line parses on its own. The whole file does not. An online formatter that expects one JSON value stops at the second object with `Expecting 'EOF' ... got '{'`.
+
+**Close other large programs first.** At the start of this run the machine had 8.3 GB free. After the 2B load it had 635 MB. The 4B load left 717 MB. Cursor is one of the larger processes on this laptop; the bench is meant to be run with it closed.
+
+## Key takeaways
+
+- **Time the decision on the machine that will run it.** A model card in milliseconds on a data-centre GPU does not tell you the cost of the same call on a laptop CPU.
+- **Dtype can dominate size.** Here the checkpoint with the smaller resident set was the one that took minutes, because it was the bf16 model on a CPU whose fast path is float32.
+- **Store the distribution, not only the label.** All three models said "no refund" on the crash. The yes probabilities were 14%, 26%, and 0.3%.
+- **Read the probability, and know what `confidence` has done to it.** On a three-way choice the stored confidence is a rescaled top probability. The two numbers diverge as soon as the call is less than certain.
+- **Keep the expected score and the named level apart.** One is a weighted index. The other is the option with the most mass. They answer different questions.
+- **Put one checkpoint in one process when the weights are a large fraction of RAM.** Exiting the worker is what gives the next model its memory back.
+- **Append a record per line if the run is long enough to interrupt.** This file still has every finished ticket if the process is stopped. It is also why a single-document JSON formatter rejects it.
+- **Three tickets are enough to see a split, and not enough to score the models.** The lockout urgency is the interesting disagreement. It is not an accuracy result.
+
+## The Code
+
+Everything is in [pyardley/DeciderDemo](https://github.com/pyardley/DeciderDemo):
+
+- `bench/run_bench.py` — one worker per checkpoint, the three tickets, and the JSONL writer
+- `Run-Bench.ps1` — runs that script with the project venv
+- `demo/models.json` — repo, revision, folder, device, and dtype for `4b-v2`, `2b`, and `0.8b`
+- `demo/server.py` — the same `Decider.system_one` call behind the page
+- `demo/static/` — the ticket desk
+- `README.md` — install, switching models, and the publishers' numbers beside these local ones
+
+The run this post quotes is `results/bench-20261005-114844.jsonl`. That directory is gitignored. The library is [`decider-ai`](https://pypi.org/project/decider-ai/) 1.8.1, with weights from [Mapika/decider-0.8b](https://huggingface.co/Mapika/decider-0.8b), [Mapika/decider-2b](https://huggingface.co/Mapika/decider-2b), and [Mapika/decider-4b](https://huggingface.co/Mapika/decider-4b) at the revisions in `demo/models.json`.
