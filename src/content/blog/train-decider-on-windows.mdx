@@ -52,7 +52,7 @@ That is 1,200 training cases and 400 test cases. The two splits were generated s
 
 Of the 1,200 training cases, 80 are held out for calibration, seed 3407. The weights see 1,120 rows. That is 280 optimizer steps. 38,147,588 of 598,651,204 parameters are trainable, 6.37%. 89 training inputs were longer than 1,024 tokens, so the end of those states was cut and the questions were kept.
 
-A steady step on this GPU takes about 70 seconds. The fastest interval in the log is 66 seconds. The trainer's wall clock was 73,420 seconds, 20 hours 24 minutes, from 15:11 on 10 October 2026 to 11:40 on 11 October. Two steps account for most of the gap between that and about five and a half hours of stepping. Step 168 sat for 99 minutes. Step 208 sat for 12.5 hours. The steps on either side of both gaps were about 70 seconds, so those two intervals are the machine asleep. Final training loss was 0.8968.
+A steady step on this GPU takes about 70 seconds. The fastest interval in the log is 66 seconds. The trainer's wall clock was 73,420 seconds, 20 hours 24 minutes, from 15:11 on 10 October 2026 to 11:40 on 11 October. Final training loss was 0.8968.
 
 The adapters, including the new head, are saved to `decider-0.8b-lora`. The git repo has the scripts. The adapters stay on the machine that trained them.
 
@@ -120,7 +120,7 @@ The accuracy bars on the page are the full test split. The filter above them cha
 - **0.792 is agreement with the teacher on workflows the model has seen.** The card's teacher self-agreement on the full set is 0.735. A specialist above that line is learning the teacher's habits on these questions.
 - **Calibration and accuracy answer different questions.** Test calibration error went from 0.012 to 0.023. The untrained model can match its own hit rate and still be wrong on most questions.
 - **At a 90% gate the trained model acts on 777 of 2,000 questions, and 34 of those are wrong.** The untrained model acts on none. Moving the slider on the page is the way to see the trade.
-- **A 4GB 1650 Ti can train this.** About 70 seconds a step, about five and a half hours of stepping, in float32 because the card has no bfloat16. The 20 hour 24 minute wall clock includes the PC sleeping through two steps.
+- **A 4GB 1650 Ti can train this.** About 70 seconds a step, about five and a half hours of stepping, in float32 because the card has no bfloat16.
 - **One case takes 2.749 seconds on the GPU either way.** Training did not change the forward time.
 
 ## The Code
