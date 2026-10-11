@@ -1,0 +1,136 @@
+---
+title: "Training Decider 0.8B on a 4GB Windows GPU"
+description: "Unsloth on Windows, two epochs of Decider 0.8B on typed-decisions, and a held-out score. Accuracy on 2,000 questions moved from 0.326 to 0.792. The comparison page is on this site."
+pubDate: 2026-10-11
+author: "Paul Yardley"
+tags: ["AI", "Local LLM", "Python"]
+readingTime: "10 min read"
+draft: false
+---
+
+I fine-tuned [Decider 0.8B](https://huggingface.co/Mapika/decider-0.8b) on a 4GB GTX 1650 Ti and scored it on 400 cases the training never saw. Accuracy on 2,000 questions moved from 0.326 to 0.792. Every dot is on [the comparison page](/decider/compare.html). You can switch untrained and trained, pick a workflow and a question, and move the confidence gate.
+
+An earlier post scored the [published checkpoint on fifty support tickets](/blog/decider-vs-laya-fifty-tickets). This one changes the weights.
+
+A score on this dataset is agreement with the teacher that labelled it. The [dataset card](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) puts that teacher's agreement with itself at 0.735 on the full 1,600 cases, with a majority baseline of 0.520 and a factor ceiling of 0.704. This run is a specialist: it trained on these four workflows and was scored on them. 0.792 above 0.735 means it is picking up that teacher's habits on questions it has already seen. [Jev](https://www.typesafe.ai/) is a general model, asked questions it was not fitted to. The fair comparison between the two is time: one local forward pass against one cloud request.
+
+## Install Unsloth on Windows
+
+The install steps came from Gemini. I kept them in the repo as `unsloth_windows_setup_guide.md`. I did not re-run the install for this post. The environment they left behind is the one that trained.
+
+From a Miniforge prompt:
+
+1. Create a conda env named `unsloth_win` on Python 3.10.
+2. Install Unsloth from git: `pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"`.
+3. Reinstall PyTorch from the CUDA 12.6 index: `pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`. A fresh Unsloth install can pull a torch build that is too old for `torchao`. This reinstall replaced torch 2.5.1+cu121 with torch 2.14.1+cu126.
+4. Check that CUDA is available and the GPU name prints. Mine printed `Torch version: 2.14.1+cu126`, `CUDA Available: True`, and `NVIDIA GeForce GTX 1650 Ti`.
+
+`conda` is not on PATH in a normal PowerShell window. The env still runs if you call its `python.exe` directly.
+
+Unsloth 2026.10.3 warns that Python 3.10 is below its recommended 3.11. Training proceeded. The 1650 Ti has no bfloat16, so this Qwen3.5 model trained in float32. There is no Windows wheel for `causal-conv1d`, and a source build needs `nvcc`, which this machine does not have. The depthwise convolution uses PyTorch's grouped `conv1d`. The timings below are that path.
+
+## What the model is learning
+
+The run starts from `Mapika/decider-0.8b`, a Qwen3.5-0.8B that Mapika already trained for decisions. Unsloth treats that checkpoint as a backbone, attaches a new decision head, and trains two things: a LoRA adapter on the backbone, and the head from scratch. The head scores every question and every option in one forward pass, and returns a probability for each option.
+
+The data is [`LocalLLaMA/typed-decisions`](https://huggingface.co/datasets/LocalLLaMA/typed-decisions), config `all`. It is an independent benchmark for the same style of typed decision as Jev. It was built on its own, and the labels did not come from Jev.
+
+Each case is synthetic. A skeleton is drawn first: topic, severity, whether a constraint was violated. A state is rendered from that skeleton. Invoices and agent traces become JSON. Customer threads and alert write-ups become prose. A teacher of roughly 4B-class capability labels the case three times at temperature 0.7. The gold answer is the mean of those three distributions, so an ambiguous decision stays soft. The loss is cross-entropy against that distribution.
+
+Four workflows, 300 training cases and 100 test cases each:
+
+- **Agent traces.** What to do with a run, including whether a person should review it.
+- **Customer service.** What action to take from a thread and the account state.
+- **Invoices.** Whether to pay, hold, or reject a vendor bill.
+- **Security incidents.** Whether to close, investigate, or contain an alert.
+
+That is 1,200 training cases and 400 test cases. The two splits were generated separately, and a case id or a state that appears in both fails the package. Training uses the train split only. Each case is one state and five questions: a choice among named options, a score on an ordered rubric, or a yes/no. The dataset calls that last type `noul`.
+
+## Train
+
+`Training.py` loads the model in 4-bit, with sequence length 1,024. LoRA rank is 16, alpha 16, dropout 0. The batch size is 1, with eight steps of gradient accumulation, so the effective batch is 8. The learning rate is 2e-4, on a cosine schedule, with 10 warmup steps and two epochs. The optimizer is 8-bit AdamW.
+
+Of the 1,200 training cases, 80 are held out for calibration, seed 3407. The weights see 1,120 rows. That is 280 optimizer steps. 38,147,588 of 598,651,204 parameters are trainable, 6.37%. 89 training inputs were longer than 1,024 tokens, so the end of those states was cut and the questions were kept.
+
+A steady step on this GPU takes about 70 seconds. The fastest interval in the log is 66 seconds. The trainer's wall clock was 73,420 seconds, 20 hours 24 minutes, from 15:11 on 10 October 2026 to 11:40 on 11 October. Two steps account for most of the gap between that and about five and a half hours of stepping. Step 168 sat for 99 minutes. Step 208 sat for 12.5 hours. The steps on either side of both gaps were about 70 seconds, so those two intervals are the machine asleep. Final training loss was 0.8968.
+
+The adapters, including the new head, are saved to `decider-0.8b-lora`. The git repo has the scripts. The adapters stay on the machine that trained them.
+
+## Fit the confidence
+
+After the two epochs, a temperature is fitted for each question type on the 80 held-out training rows. The fit leaves the winning option where it is. It scales the probabilities so a stated confidence sits closer to the hit rate. Calls made at about 90% should be right about 90% of the time.
+
+On those 80 rows the fitted model reported accuracy 0.805 and an expected calibration error of 0.029. That is the calibration set. The test score is the next section.
+
+## Score the test split
+
+`compare.py` loads one model at a time. The 4GB card holds one of them. Untrained means the same starting point as training: the published checkpoint, a fresh decision head, and LoRA at step 0, with the same seed. Trained means the saved adapters.
+
+It scores all 400 test cases, 2,000 questions. None were skipped. 30 of those cases were also cut at 1,024 tokens. The first case of each model is warmup and is left out of the timing.
+
+The first scoring attempt ran out of memory. The forward pass was still keeping the training graph, and a float32 Qwen3.5 pass does not fit in 4GB with that graph attached. Scoring with the graph switched off fits, and that is the run below. It took 2,321 seconds and finished at 12:30 on 11 October.
+
+Accuracy is the share of questions whose top option matches the gold label.
+
+|                       |     n | Untrained | Trained | Change |
+| --------------------- | ----: | --------: | ------: | -----: |
+| Overall               | 2,000 |     0.326 |   0.792 | +0.466 |
+| Choice                |   600 |     0.197 |   0.748 | +0.552 |
+| Score                 |   800 |     0.269 |   0.765 | +0.496 |
+| Yes/no                |   600 |     0.532 |   0.873 | +0.342 |
+| Agent traces          |   500 |     0.338 |   0.736 | +0.398 |
+| Customer service      |   500 |     0.290 |   0.830 | +0.540 |
+| Invoice processing    |   500 |     0.316 |   0.832 | +0.516 |
+| Security incidents    |   500 |     0.360 |   0.772 | +0.412 |
+
+Expected calibration error on the full test split is 0.012 untrained and 0.023 trained. A low error means the stated probability matches the hit rate. It is a separate fact from the choices being right. The untrained model can sit close to its own hit rate and still pick the wrong option most of the time.
+
+Whole-case accuracy, every question in a case right, is 0.013 untrained and 0.388 trained.
+
+Median GPU time for one case, after warmup, is 2.749 seconds for both models. The means are 2.809 seconds untrained and 2.741 seconds trained. That is GPU time for the forward pass. Tokenizing, loading the model, and any network wait are extra.
+
+## Read the page
+
+[`/decider/compare.html`](/decider/compare.html) is one file. The scores are embedded in it, so the page needs no model and no extra request. The controls are the part worth using: the ring is one workflow and one question, and the gate is a slider from 50% to 99%.
+
+The ring draws one dot per test case, on the option the model chose. Teal means that option is the gold label. Red means it chose something else. The number in the middle is accuracy for that question, and the gold arc is the same share of the circle. The idea is the radial chart in [Daniel Walsh's Laya video](https://www.youtube.com/watch?v=ICtPrhMBUKA). This run has a switch for untrained and trained, because it does not have a score after every training step.
+
+Customer service, the action question, before training. The dots pile onto Answer Directly.
+
+![Untrained Decider on the customer-service action question, with most dots piled on Answer Directly and 17 percent correct](/blog/train-decider-0.8b-windows/ring-untrained.png)
+_17 of 100 unseen customer-service cases. The model has a favourite option and uses it._
+
+The same question after training. The dots spread onto the options the labels name.
+
+![Trained Decider on the same customer-service action question, with dots spread around the ring and 71 percent correct](/blog/train-decider-0.8b-windows/ring-trained.png)
+_71 of 100 on that question. The dots leave the single pile. Escalate to Human is still a mixed cluster._
+
+The strips below the ring are every test question, placed by the probability on the winning option. The line is a gate. At or above it, an application would act on its own. Below it, the case goes to a person or a larger model. The wrong counts are wrong among the decisions let through.
+
+![Confidence strips for all 2,000 questions, with a 90 percent gate: the untrained model lets nothing through and the trained model acts on 777](/blog/train-decider-0.8b-windows/confidence-gate.png)
+_At the default 90% gate, untrained sends all 2,000 questions for review. Trained acts on 777 and sends 1,223 for review. 34 of those 777 are wrong, 4.4% of the ones it would act on._
+
+Training changes which option wins as well as the probability, so this gate is an operating picture of each model. It is the same shape of count as a before-and-after of temperature scaling, and a different experiment: the two models are allowed to disagree about the answer.
+
+The accuracy bars on the page are the full test split. The filter above them changes the dots and the gate. It leaves the bars alone.
+
+## Key Takeaways
+
+- **The headline move is 0.326 to 0.792 on 2,000 held-out questions.** Choice questions moved the most, from 0.197 to 0.748. Yes/no started at 0.532 and finished at 0.873.
+- **0.792 is agreement with the teacher on workflows the model has seen.** The card's teacher self-agreement on the full set is 0.735. A specialist above that line is learning the teacher's habits on these questions.
+- **Calibration and accuracy answer different questions.** Test calibration error went from 0.012 to 0.023. The untrained model can match its own hit rate and still be wrong on most questions.
+- **At a 90% gate the trained model acts on 777 of 2,000 questions, and 34 of those are wrong.** The untrained model acts on none. Moving the slider on the page is the way to see the trade.
+- **A 4GB 1650 Ti can train this.** About 70 seconds a step, about five and a half hours of stepping, in float32 because the card has no bfloat16. The 20 hour 24 minute wall clock includes the PC sleeping through two steps.
+- **One case takes 2.749 seconds on the GPU either way.** Training did not change the forward time.
+
+## The Code
+
+The run is in [pyardley/DeciderTraining](https://github.com/pyardley/DeciderTraining):
+
+- `unsloth_windows_setup_guide.md` is the Windows install sequence
+- `Training.py` is the fine-tune
+- `compare.py` scores the test split and writes `results/compare.json`
+- `report.py` turns that JSON into the standalone page
+- The page on this site is that file, at [`/decider/compare.html`](/decider/compare.html)
+
+Unsloth's own write-up of the trainer is [Train your own decision model](https://unsloth.ai/docs/basics/train-your-own-decision-model-with-unsloth).
