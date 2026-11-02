@@ -9,6 +9,9 @@ import sitemap from "@astrojs/sitemap";
 // https://astro.build/config
 export default defineConfig({
   site: "https://paulyardleyqa.co.uk",
+  redirects: {
+    "/z80debug": "/z80debug.html",
+  },
   vite: {
     plugins: [tailwindcss()],
   },
